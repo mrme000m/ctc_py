@@ -33,6 +33,8 @@ from .errors import (
     CTraderError,
     CTraderRateLimitError,
     CTraderTimeoutError,
+    CTraderTradingError,
+    raise_for_error,
 )
 from .events import EventEmitter
 from .proto import decode_frame, encode_frame
@@ -47,6 +49,22 @@ from .utils import (
     raw_to_pips,
     sl_tp_from_pips,
     money_to_raw,
+)
+from .symbol import SymbolInfo, symbol_info_from_raw
+from .normalize import (
+    normalize_bar,
+    normalize_bars,
+    normalize_tick,
+    normalize_ticks,
+    normalize_spot,
+    normalize_position,
+    normalize_positions,
+    normalize_order,
+    normalize_orders,
+    normalize_deal,
+    normalize_deals,
+    normalize_execution,
+    normalize_trader,
 )
 
 logger = logging.getLogger("ctc_py")
@@ -119,6 +137,28 @@ class _TokenBucket:
 # ──────────────────────────────────────────────────────────────────────
 
 
+class ConnectionState:
+    """String constants representing the client connection state.
+
+    Check via ``client.connection_state``::
+
+        if client.connection_state == ConnectionState.READY:
+            ...  # safe to send requests
+    """
+    DISCONNECTED  = "disconnected"
+    """No WebSocket connection."""
+    CONNECTING    = "connecting"
+    """WebSocket handshake in progress."""
+    AUTHENTICATING = "authenticating"
+    """Application-level auth (``APPLICATION_AUTH_REQ``) in progress."""
+    CONNECTED     = "connected"
+    """WebSocket open and app authenticated; account auth may still be needed."""
+    READY         = "ready"
+    """Fully ready: WebSocket open, app authed, ≥1 account authed."""
+    RECONNECTING  = "reconnecting"
+    """Lost connection; reconnect loop is running."""
+
+
 @dataclass
 class CTraderClientConfig:
     """Configuration for :class:`CTraderClient`.
@@ -141,6 +181,8 @@ class CTraderClientConfig:
         If ``True``, auto-reconnect on unexpected disconnects.
     reconnect_delay:
         Base delay (seconds) between reconnection attempts.
+    reconnect_delay_max:
+        Cap on the exponential back-off delay (seconds).
     max_reconnect_attempts:
         Maximum number of reconnection attempts. ``0`` = unlimited.
     open_timeout:
@@ -149,6 +191,9 @@ class CTraderClientConfig:
         Seconds to wait while closing WebSocket.
     debug:
         Enable verbose debug logging to console.
+    validate_config:
+        If ``True`` (default), validate ``client_id`` / ``client_secret`` / ``env``
+        on construction and raise :class:`ValueError` for obviously bad values.
     """
 
     client_id: str = ""
@@ -159,10 +204,12 @@ class CTraderClientConfig:
     heartbeat_interval: float = 10.0
     auto_reconnect: bool = True
     reconnect_delay: float = 5.0
+    reconnect_delay_max: float = 60.0
     max_reconnect_attempts: int = 10
     open_timeout: float = 30.0
     close_timeout: float = 5.0
     debug: bool = False
+    validate_config: bool = True
 
     # ── Proactive rate limiting (token-bucket throttler) ──────────────
     # Official cTrader limits (per connection):
@@ -181,6 +228,22 @@ class CTraderClientConfig:
     """Retries on REQUEST_FREQUENCY_EXCEEDED after proactive throttle fails."""
     rate_limit_base_delay: float = 0.25
     """Initial back-off delay (seconds) for reactive retries. Doubles each attempt."""
+
+    def __post_init__(self) -> None:
+        if not self.validate_config:
+            return
+        if self.env not in ("live", "demo"):
+            raise ValueError(
+                f"CTraderClientConfig.env must be 'live' or 'demo', got {self.env!r}"
+            )
+        if self.client_id and len(self.client_id.strip()) < 3:
+            raise ValueError(
+                "CTraderClientConfig.client_id appears invalid (too short)"
+            )
+        if self.reconnect_delay <= 0:
+            raise ValueError("reconnect_delay must be > 0")
+        if self.request_timeout <= 0:
+            raise ValueError("request_timeout must be > 0")
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -245,6 +308,9 @@ class CTraderClient(EventEmitter):
         self._intentional_close = False
         self._reconnect_attempts = 0
         self._app_authed = False
+        self._state: str = ConnectionState.DISCONNECTED
+        # Event set to True when state reaches CONNECTED or READY
+        self._ready_event: asyncio.Event = asyncio.Event()
 
         # Pending request map:  clientMsgId → _PendingRequest
         self._pending: dict[str, _PendingRequest] = {}
@@ -283,6 +349,49 @@ class CTraderClient(EventEmitter):
         """``True`` if the WebSocket is open and the app is authenticated."""
         return self._connected and self._app_authed
 
+    @property
+    def connection_state(self) -> str:
+        """Detailed connection state string. See :class:`ConnectionState` for values.
+
+        Possible values: ``"disconnected"``, ``"connecting"``, ``"authenticating"``,
+        ``"connected"``, ``"ready"``, ``"reconnecting"``.
+        """
+        return self._state
+
+    def _set_state(self, state: str) -> None:
+        """Update state and emit state-change event."""
+        if self._state != state:
+            prev = self._state
+            self._state = state
+            logger.debug("Connection state: %s → %s", prev, state)
+            self.emit("state_change", {"state": state, "previous": prev})
+            if state in (ConnectionState.CONNECTED, ConnectionState.READY):
+                self._ready_event.set()
+            elif state in (ConnectionState.DISCONNECTED, ConnectionState.RECONNECTING):
+                self._ready_event.clear()
+
+    async def wait_for_connection(self, timeout: float = 30.0) -> bool:
+        """Wait until the client reaches CONNECTED or READY state.
+
+        Useful after a reconnect event to wait until the client is fully
+        operational before sending requests.
+
+        Parameters
+        ----------
+        timeout:
+            Maximum seconds to wait.
+
+        Returns
+        -------
+        bool
+            ``True`` if connected within timeout, ``False`` if timed out.
+        """
+        try:
+            await asyncio.wait_for(self._ready_event.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
     # ══════════════════════════════════════════════════════════════════
     #  CONNECTION LIFECYCLE
     # ══════════════════════════════════════════════════════════════════
@@ -291,8 +400,11 @@ class CTraderClient(EventEmitter):
         """Open the WebSocket and authenticate the application."""
         self._intentional_close = False
         self._reconnect_attempts = 0
+        self._set_state(ConnectionState.CONNECTING)
         await self._open_websocket()
+        self._set_state(ConnectionState.AUTHENTICATING)
         await self._auth_app()
+        self._set_state(ConnectionState.CONNECTED)
         logger.info("Connected and authenticated to %s", self._ws_url)
 
     async def disconnect(self) -> None:
@@ -318,6 +430,7 @@ class CTraderClient(EventEmitter):
                 pass
             self._ws = None
         self._connected = False
+        self._set_state(ConnectionState.DISCONNECTED)
         self.emit("disconnected", {"reason": "intentional"})
         logger.info("Disconnected")
 
@@ -373,17 +486,17 @@ class CTraderClient(EventEmitter):
         if payload_type == PT.HEARTBEAT_EVENT:
             return
 
-        # 2. Global OA_ERROR_RES
+        # 2. Global OA_ERROR_RES — dispatch granular exception via raise_for_error
         if payload_type == PT.OA_ERROR_RES:
-            err = CTraderError(
-                error_code=payload.get("errorCode", "UNKNOWN"),
-                description=payload.get("description"),
-                raw=payload,
-            )
-            if client_msg_id and client_msg_id in self._pending:
-                self._resolve_pending(client_msg_id, error=err)
-            else:
-                self.emit("error", err)
+            error_code = payload.get("errorCode", "UNKNOWN")
+            description = payload.get("description")
+            try:
+                raise_for_error(error_code, description, payload)
+            except Exception as err:
+                if client_msg_id and client_msg_id in self._pending:
+                    self._resolve_pending(client_msg_id, error=err)
+                else:
+                    self.emit("error", err)
             return
 
         # 3. Correlated response (has matching clientMsgId)
@@ -391,12 +504,10 @@ class CTraderClient(EventEmitter):
             # Check for embedded errorCode (e.g. in execution events)
             error_code = payload.get("errorCode")
             if error_code:
-                err = CTraderError(
-                    error_code=error_code,
-                    description=payload.get("description"),
-                    raw=payload,
-                )
-                self._resolve_pending(client_msg_id, error=err)
+                try:
+                    raise_for_error(error_code, payload.get("description"), payload)
+                except Exception as err:
+                    self._resolve_pending(client_msg_id, error=err)
             else:
                 self._resolve_pending(client_msg_id, result=payload)
             # Also emit as event if it's a push-type
@@ -418,38 +529,70 @@ class CTraderClient(EventEmitter):
         self._stop_heartbeat()
         self._reject_all_pending("Connection lost")
         self._app_authed = False
+        self._set_state(ConnectionState.RECONNECTING if self._cfg.auto_reconnect else ConnectionState.DISCONNECTED)
         self.emit("disconnected", {"reason": "unexpected"})
 
         if self._cfg.auto_reconnect:
             max_attempts = self._cfg.max_reconnect_attempts
             if max_attempts and self._reconnect_attempts >= max_attempts:
                 logger.error("Max reconnect attempts (%d) reached", max_attempts)
+                self._set_state(ConnectionState.DISCONNECTED)
                 return
             self._reconnect_attempts += 1
-            delay = self._cfg.reconnect_delay * self._reconnect_attempts
+            # Exponential back-off capped at reconnect_delay_max
+            delay = min(
+                self._cfg.reconnect_delay * (2 ** (self._reconnect_attempts - 1)),
+                self._cfg.reconnect_delay_max,
+            )
             logger.info("Reconnecting in %.1fs (attempt %d)…", delay, self._reconnect_attempts)
             self.emit("reconnecting", {"attempt": self._reconnect_attempts, "delay": delay})
             asyncio.get_event_loop().create_task(self._reconnect(delay))
 
     async def _reconnect(self, delay: float) -> None:
+        """Blocking reconnect: sleep → open WS → auth app → re-auth all accounts.
+
+        Only emits ``reconnected`` after ALL accounts are restored so
+        consumers can safely assume full state when they receive the event.
+        """
         await asyncio.sleep(delay)
         try:
+            self._set_state(ConnectionState.CONNECTING)
             await self._open_websocket()
+            self._set_state(ConnectionState.AUTHENTICATING)
             await self._auth_app()
-            # Re-authorise previously authorised accounts (best-effort)
+
+            # Re-authorise ALL previously authorised accounts atomically.
+            # We do this before emitting reconnected so callers don't
+            # accidentally send account-scoped requests before auth completes.
+            failed_accounts: list[int] = []
             for acct_id, token in list(self._authorized_accounts.items()):
                 try:
                     await self._request(PT.ACCOUNT_AUTH_REQ, {
                         "ctidTraderAccountId": acct_id,
                         "accessToken": token,
                     })
+                    logger.debug("Re-authed account %d after reconnect", acct_id)
                 except Exception:
                     logger.warning("Failed to re-auth account %d on reconnect", acct_id)
+                    failed_accounts.append(acct_id)
+            # Remove accounts that could not be re-authorised
+            for acct_id in failed_accounts:
+                self._authorized_accounts.pop(acct_id, None)
+
             self._reconnect_attempts = 0
-            self.emit("reconnected", {"attempt": self._reconnect_attempts})
-            logger.info("Reconnected successfully")
+            # Determine correct final state
+            if self._authorized_accounts:
+                self._set_state(ConnectionState.READY)
+            else:
+                self._set_state(ConnectionState.CONNECTED)
+            self.emit("reconnected", {
+                "attempt": self._reconnect_attempts,
+                "failed_accounts": failed_accounts,
+            })
+            logger.info("Reconnected successfully (state=%s)", self._state)
         except Exception:
-            logger.exception("Reconnection failed")
+            logger.exception("Reconnection attempt %d failed", self._reconnect_attempts)
+            self._connected = False
             self._on_unexpected_close()
 
     # ── Heartbeat ───────────────────────────────────────────────────
@@ -680,6 +823,7 @@ class CTraderClient(EventEmitter):
             "accessToken": access_token,
         })
         self._authorized_accounts[ctid_trader_account_id] = access_token
+        self._set_state(ConnectionState.READY)
         logger.info("Account %d authorized", ctid_trader_account_id)
         return result
 
@@ -1316,3 +1460,646 @@ class CTraderClient(EventEmitter):
             "ctidTraderAccountId": account_id,
             "leverageId": leverage_id,
         })
+
+    # ══════════════════════════════════════════════════════════════════
+    #  SYMBOL INFO CACHE  (smart helpers)
+    # ══════════════════════════════════════════════════════════════════
+
+    # Per-account symbol info cache:  account_id → {symbol_id → SymbolInfo}
+    # Lazily initialised here so subclasses / tests can still use __init__
+    # without changes.
+
+    def _sym_cache(self, account_id: int) -> dict[int, "SymbolInfo"]:
+        if not hasattr(self, "_symbol_cache"):
+            self._symbol_cache: dict[int, dict[int, SymbolInfo]] = {}
+        return self._symbol_cache.setdefault(account_id, {})
+
+    def _get_money_digits(self, account_id: int) -> int:
+        """Return cached moneyDigits for an account (default 2 if not yet fetched)."""
+        if not hasattr(self, "_money_digits_cache"):
+            self._money_digits_cache: dict[int, int] = {}
+        return self._money_digits_cache.get(account_id, 2)
+
+    def _set_money_digits(self, account_id: int, digits: int) -> None:
+        if not hasattr(self, "_money_digits_cache"):
+            self._money_digits_cache: dict[int, int] = {}
+        self._money_digits_cache[account_id] = digits
+
+    async def get_symbol_info(
+        self,
+        account_id: int,
+        symbol_id: int,
+        *,
+        use_cache: bool = True,
+    ) -> "SymbolInfo":
+        """Get a fully-populated :class:`SymbolInfo` for a symbol.
+
+        Fetches full symbol details from the API and caches the result.
+        Subsequent calls with the same ``symbol_id`` return instantly from
+        the cache (pass ``use_cache=False`` to force a refresh).
+
+        Parameters
+        ----------
+        account_id:
+            The authorized trading account ID.
+        symbol_id:
+            Numeric symbol ID.
+        use_cache:
+            If ``True`` (default), return cached result when available.
+
+        Returns
+        -------
+        SymbolInfo
+            Typed symbol info with all conversions pre-computed.
+        """
+        cache = self._sym_cache(account_id)
+        if use_cache and symbol_id in cache:
+            return cache[symbol_id]
+
+        # Ensure moneyDigits is populated
+        money_digits = self._get_money_digits(account_id)
+        if money_digits == 2:  # default — try to fetch
+            try:
+                trader_resp = await self.get_trader(account_id)
+                trader = trader_resp.get("trader", trader_resp)
+                money_digits = int(trader.get("moneyDigits", 2))
+                self._set_money_digits(account_id, money_digits)
+            except Exception:
+                pass
+
+        detail = await self.get_symbol_detail(account_id, symbol_id)
+        if detail is None:
+            # Fall back to light symbol list
+            resp = await self.get_symbols(account_id)
+            for sym in resp.get("symbol", []):
+                if int(sym.get("symbolId", 0)) == symbol_id:
+                    detail = sym
+                    break
+        if detail is None:
+            raise ValueError(f"Symbol {symbol_id} not found on account {account_id}")
+
+        info = symbol_info_from_raw(detail, money_digits=money_digits)
+        cache[symbol_id] = info
+        return info
+
+    async def get_symbol_info_by_name(
+        self,
+        account_id: int,
+        symbol_name: str,
+        *,
+        use_cache: bool = True,
+    ) -> "SymbolInfo | None":
+        """Get :class:`SymbolInfo` by symbol name (case-insensitive).
+
+        Returns ``None`` if the symbol is not found on this account.
+        """
+        # Check cache first
+        if use_cache and hasattr(self, "_symbol_cache"):
+            for info in self._symbol_cache.get(account_id, {}).values():
+                if info.symbol_name.lower() == symbol_name.lower():
+                    return info
+
+        light = await self.resolve_symbol(account_id, symbol_name)
+        if light is None:
+            return None
+        return await self.get_symbol_info(account_id, int(light["symbolId"]), use_cache=use_cache)
+
+    def invalidate_symbol_cache(self, account_id: int | None = None) -> None:
+        """Clear the symbol info cache.
+
+        Parameters
+        ----------
+        account_id:
+            If given, clear only for that account; otherwise clear all.
+        """
+        if not hasattr(self, "_symbol_cache"):
+            return
+        if account_id is None:
+            self._symbol_cache.clear()
+        else:
+            self._symbol_cache.pop(account_id, None)
+
+    # ══════════════════════════════════════════════════════════════════
+    #  SMART TRADER INFO
+    # ══════════════════════════════════════════════════════════════════
+
+    async def get_trader_info(self, account_id: int) -> dict[str, Any]:
+        """Get normalized trader/account info.
+
+        Returns a human-readable dict with ``balance`` as a float,
+        ``leverage`` as a ratio, ``money_digits``, ``is_live``, etc.
+        Caches ``moneyDigits`` for use in subsequent calls.
+
+        See :func:`ctc_py.normalize.normalize_trader` for the full key list.
+        """
+        raw = await self.get_trader(account_id)
+        result = normalize_trader(raw)
+        self._set_money_digits(account_id, result["money_digits"])
+        return result
+
+    # ══════════════════════════════════════════════════════════════════
+    #  SMART TRADING ORDERS  (lots + pips, no raw values required)
+    # ══════════════════════════════════════════════════════════════════
+
+    async def smart_market_order(
+        self,
+        account_id: int,
+        symbol_id: int,
+        trade_side: int,
+        lots: float,
+        *,
+        sl_pips: float | None = None,
+        tp_pips: float | None = None,
+        comment: str | None = None,
+        **extra: Any,
+    ) -> dict[str, Any]:
+        """Place a market order using **lots** and **pip distances**.
+
+        Unlike :meth:`market_order`, you do NOT need to:
+
+        - convert lots to raw volume (``lots_to_volume``)
+        - calculate raw SL/TP prices from pip distances
+        - know the symbol's pip position
+
+        The client fetches and caches the symbol's metadata automatically.
+
+        Parameters
+        ----------
+        account_id:
+            Authorized account ID.
+        symbol_id:
+            Numeric symbol ID.
+        trade_side:
+            ``TradeSide.BUY`` (1) or ``TradeSide.SELL`` (2).
+        lots:
+            Position size in lots (e.g. ``0.1``).  Automatically snapped
+            to the symbol's min/step constraints.
+        sl_pips:
+            Stop-loss distance in pips from the entry price, or ``None``.
+        tp_pips:
+            Take-profit distance in pips from the entry price, or ``None``.
+        comment:
+            Optional order comment.
+
+        Returns
+        -------
+        dict
+            Raw execution event payload.
+        """
+        sym = await self.get_symbol_info(account_id, symbol_id)
+        volume = sym.snap_volume(lots)
+        params: dict[str, Any] = {}
+        if comment is not None:
+            params["comment"] = comment
+
+        # SL/TP: we need the entry price — subscribe momentarily to get a spot
+        if sl_pips is not None or tp_pips is not None:
+            await self.subscribe_spots(account_id, [symbol_id])
+            spot = await self.wait_for("spot", timeout=10.0)
+            await self.unsubscribe_spots(account_id, [symbol_id])
+            # BUY fills at ask, SELL fills at bid
+            entry_raw = int(spot.get("ask", 0)) if trade_side == 1 else int(spot.get("bid", 0))
+            sltp = sym.sl_tp_prices(
+                normalize_price(entry_raw), trade_side,
+                sl_pips=sl_pips, tp_pips=tp_pips,
+            )
+            if sltp.get("stopLoss") is not None:
+                params["stopLoss"] = sltp["stopLoss"]
+            if sltp.get("takeProfit") is not None:
+                params["takeProfit"] = sltp["takeProfit"]
+
+        params.update(extra)
+        return await self.market_order(account_id, symbol_id, trade_side, volume, **params)
+
+    async def smart_limit_order(
+        self,
+        account_id: int,
+        symbol_id: int,
+        trade_side: int,
+        lots: float,
+        limit_price: float,
+        *,
+        sl_pips: float | None = None,
+        tp_pips: float | None = None,
+        comment: str | None = None,
+        **extra: Any,
+    ) -> dict[str, Any]:
+        """Place a limit order using **lots** (not raw volume) and **pip distances**.
+
+        Parameters
+        ----------
+        limit_price:
+            Human float price (e.g. ``1.0850``).
+        sl_pips / tp_pips:
+            Distance in pips from ``limit_price``.
+        """
+        sym = await self.get_symbol_info(account_id, symbol_id)
+        volume = sym.snap_volume(lots)
+        sltp = sym.sl_tp_prices(limit_price, trade_side, sl_pips=sl_pips, tp_pips=tp_pips)
+        params: dict[str, Any] = {}
+        if comment is not None:
+            params["comment"] = comment
+        if sltp.get("stopLoss") is not None:
+            params["stopLoss"] = sltp["stopLoss"]
+        if sltp.get("takeProfit") is not None:
+            params["takeProfit"] = sltp["takeProfit"]
+        params.update(extra)
+        return await self.limit_order(
+            account_id, symbol_id, trade_side, volume,
+            price_to_raw(limit_price),
+            **params,
+        )
+
+    async def smart_stop_order(
+        self,
+        account_id: int,
+        symbol_id: int,
+        trade_side: int,
+        lots: float,
+        stop_price: float,
+        *,
+        sl_pips: float | None = None,
+        tp_pips: float | None = None,
+        comment: str | None = None,
+        **extra: Any,
+    ) -> dict[str, Any]:
+        """Place a stop order using **lots** and **pip distances**.
+
+        Parameters
+        ----------
+        stop_price:
+            Human float trigger price (e.g. ``1.0900``).
+        sl_pips / tp_pips:
+            Distance in pips from ``stop_price``.
+        """
+        sym = await self.get_symbol_info(account_id, symbol_id)
+        volume = sym.snap_volume(lots)
+        sltp = sym.sl_tp_prices(stop_price, trade_side, sl_pips=sl_pips, tp_pips=tp_pips)
+        params: dict[str, Any] = {}
+        if comment is not None:
+            params["comment"] = comment
+        if sltp.get("stopLoss") is not None:
+            params["stopLoss"] = sltp["stopLoss"]
+        if sltp.get("takeProfit") is not None:
+            params["takeProfit"] = sltp["takeProfit"]
+        params.update(extra)
+        return await self.stop_order(
+            account_id, symbol_id, trade_side, volume,
+            price_to_raw(stop_price),
+            **params,
+        )
+
+    async def smart_set_sl_tp(
+        self,
+        account_id: int,
+        position_id: int,
+        entry_price: float,
+        trade_side: int,
+        symbol_id: int,
+        *,
+        sl_pips: float | None = None,
+        tp_pips: float | None = None,
+    ) -> dict[str, Any]:
+        """Set SL/TP from pip distances using human float entry price.
+
+        Parameters
+        ----------
+        entry_price:
+            Position open price as a human float.
+        trade_side:
+            ``1`` for BUY, ``2`` for SELL.
+        symbol_id:
+            Used to look up the symbol's pip position.
+        sl_pips / tp_pips:
+            Distance in pips.
+        """
+        sym = await self.get_symbol_info(account_id, symbol_id)
+        sltp = sym.sl_tp_prices(entry_price, trade_side, sl_pips=sl_pips, tp_pips=tp_pips)
+        params = filter_none({
+            "stopLoss":   price_to_raw(sltp["stopLoss"])   if sltp.get("stopLoss")   is not None else None,
+            "takeProfit": price_to_raw(sltp["takeProfit"]) if sltp.get("takeProfit") is not None else None,
+        })
+        return await self.amend_position_sltp(account_id, position_id, **params)
+
+    async def smart_amend_order(
+        self,
+        account_id: int,
+        order_id: int,
+        symbol_id: int,
+        trade_side: int,
+        *,
+        lots: float | None = None,
+        price: float | None = None,
+        sl_pips: float | None = None,
+        tp_pips: float | None = None,
+        expiry_timestamp: int | None = None,
+        comment: str | None = None,
+        **extra: Any,
+    ) -> dict[str, Any]:
+        """Amend a pending order using **lots** and **pip distances**.
+
+        Unlike :meth:`amend_order`, you do NOT need to convert lots to raw
+        volume, calculate SL/TP raw prices, or know the symbol's pip position.
+
+        Parameters
+        ----------
+        account_id:
+            Authorized account ID.
+        order_id:
+            ID of the pending order to amend.
+        symbol_id:
+            Symbol ID (needed to look up pip position and lot size).
+        trade_side:
+            ``TradeSide.BUY`` (1) or ``TradeSide.SELL`` (2). Used to compute
+            correct SL/TP direction relative to ``price``.
+        lots:
+            New order size in lots. If ``None``, volume is not changed.
+        price:
+            New limit or stop price as a human float (e.g. ``1.0850``).
+            If ``None``, price is not changed.
+        sl_pips:
+            Stop-loss distance in pips from ``price`` (or current order price
+            if ``price`` is not provided). Pass ``None`` to leave SL unchanged.
+        tp_pips:
+            Take-profit distance in pips. Pass ``None`` to leave TP unchanged.
+        expiry_timestamp:
+            New expiry as Unix milliseconds. ``None`` = no change.
+        comment:
+            New order comment. ``None`` = no change.
+
+        Returns
+        -------
+        dict
+            Raw execution event payload.
+        """
+        sym = await self.get_symbol_info(account_id, symbol_id)
+        params: dict[str, Any] = {}
+
+        if lots is not None:
+            params["volume"] = sym.snap_volume(lots)
+
+        if price is not None:
+            params["limitPrice"] = price_to_raw(price)
+
+        if sl_pips is not None or tp_pips is not None:
+            # Use provided price or fall back to current order price via reconcile
+            anchor_price = price
+            if anchor_price is None:
+                # Fetch order details to get current price
+                try:
+                    order_detail = await self.get_order_details(account_id, order_id)
+                    raw_lp = order_detail.get("limitPrice") or order_detail.get("stopPrice")
+                    if raw_lp:
+                        anchor_price = normalize_price(int(raw_lp))
+                except Exception:
+                    pass
+
+            if anchor_price is not None:
+                sltp = sym.sl_tp_prices(
+                    anchor_price, trade_side,
+                    sl_pips=sl_pips, tp_pips=tp_pips,
+                )
+                if sltp.get("stopLoss") is not None:
+                    params["stopLoss"] = price_to_raw(sltp["stopLoss"])
+                if sltp.get("takeProfit") is not None:
+                    params["takeProfit"] = price_to_raw(sltp["takeProfit"])
+            else:
+                logger.warning(
+                    "smart_amend_order: could not determine anchor price for SL/TP; "
+                    "pass price= explicitly to fix this"
+                )
+
+        if expiry_timestamp is not None:
+            params["expirationTimestamp"] = expiry_timestamp
+        if comment is not None:
+            params["comment"] = comment
+
+        params.update(extra)
+        return await self.amend_order(account_id, order_id, **params)
+
+    async def smart_close_position(
+        self,
+        account_id: int,
+        position_id: int,
+        lots: float,
+    ) -> dict[str, Any]:
+        """Close (or partially close) a position specifying size in lots."""
+        vol = lots_to_volume(lots)
+        return await self.close_position(account_id, position_id, vol)
+
+    async def risk_market_order(
+        self,
+        account_id: int,
+        symbol_id: int,
+        trade_side: int,
+        risk_percent: float,
+        sl_pips: float,
+        *,
+        tp_pips: float | None = None,
+        pip_value_per_lot: float | None = None,
+        comment: str | None = None,
+        **extra: Any,
+    ) -> dict[str, Any]:
+        """Place a market order sized to risk a fixed percentage of account balance.
+
+        This is the highest-level convenience wrapper — you only need to
+        specify your risk appetite.
+
+        Parameters
+        ----------
+        risk_percent:
+            Percentage of account balance to risk (e.g. ``1.0`` = 1%).
+        sl_pips:
+            Stop-loss distance in pips (must be > 0).
+        tp_pips:
+            Take-profit distance in pips (optional).
+        pip_value_per_lot:
+            Monetary value of 1 pip on 1 lot in deposit currency.
+            Estimated automatically if not provided (FX-standard formula).
+        comment:
+            Optional order comment.
+
+        Returns
+        -------
+        dict
+            Raw execution event payload.
+        """
+        # Fetch account balance and symbol info
+        trader_info = await self.get_trader_info(account_id)
+        balance     = trader_info["balance"]
+        sym         = await self.get_symbol_info(account_id, symbol_id)
+
+        lots = sym.lots_for_risk(
+            account_balance=balance,
+            risk_percent=risk_percent,
+            sl_pips=sl_pips,
+            pip_value_per_lot=pip_value_per_lot,
+            snap=True,
+        )
+        logger.info(
+            "risk_market_order: balance=%.2f risk=%.1f%% sl=%g pips → %.4f lots (volume=%d)",
+            balance, risk_percent, sl_pips, lots, sym.lots_to_volume(lots),
+        )
+        return await self.smart_market_order(
+            account_id, symbol_id, trade_side, lots,
+            sl_pips=sl_pips, tp_pips=tp_pips,
+            comment=comment, **extra,
+        )
+
+    # ══════════════════════════════════════════════════════════════════
+    #  SMART HISTORICAL DATA  (normalised responses)
+    # ══════════════════════════════════════════════════════════════════
+
+    async def get_bars(
+        self,
+        account_id: int,
+        *,
+        symbol_id: int,
+        period: int,
+        from_timestamp: int | None = None,
+        to_timestamp: int | None = None,
+        count: int | None = None,
+        use_cache: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Fetch historical bars and return **normalized** dicts.
+
+        Identical to :meth:`get_trendbars` but auto-resolves symbol metadata
+        and returns human-readable OHLCV dicts instead of raw API dicts.
+
+        Each bar dict contains: ``time``, ``timestamp_ms``, ``open``,
+        ``high``, ``low``, ``close``, ``volume`` (lots), ``volume_raw``,
+        ``digits``.
+        """
+        sym = await self.get_symbol_info(account_id, symbol_id, use_cache=use_cache)
+        resp = await self.get_trendbars(
+            account_id,
+            symbol_id=symbol_id,
+            period=period,
+            from_timestamp=from_timestamp,
+            to_timestamp=to_timestamp,
+            count=count,
+        )
+        return normalize_bars(
+            resp.get("trendbar", []),
+            digits=sym.digits,
+            pip_position=sym.pip_position,
+        )
+
+    async def get_ticks(
+        self,
+        account_id: int,
+        *,
+        symbol_id: int,
+        quote_type: int,
+        from_timestamp: int | None = None,
+        to_timestamp: int | None = None,
+        use_cache: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Fetch historical ticks and return **normalized** dicts.
+
+        Each tick dict contains: ``time``, ``timestamp_ms``, ``price``,
+        ``digits``.
+        """
+        sym = await self.get_symbol_info(account_id, symbol_id, use_cache=use_cache)
+        resp = await self.get_tick_data(
+            account_id,
+            symbol_id=symbol_id,
+            quote_type=quote_type,
+            from_timestamp=from_timestamp,
+            to_timestamp=to_timestamp,
+        )
+        return normalize_ticks(resp.get("tickData", []), digits=sym.digits)
+
+    async def get_open_positions(
+        self,
+        account_id: int,
+        *,
+        normalize: bool = True,
+        symbol_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Get open positions, optionally normalized to human-readable form.
+
+        Parameters
+        ----------
+        normalize:
+            If ``True`` (default), return human-readable dicts.
+        symbol_id:
+            If given, filter to positions for a specific symbol.
+        """
+        recon = await self.reconcile(account_id)
+        positions = recon.get("position", [])
+        if symbol_id is not None:
+            positions = [
+                p for p in positions
+                if int(p.get("tradeData", {}).get("symbolId", 0)) == symbol_id
+            ]
+        if not normalize:
+            return positions
+        money_digits = self._get_money_digits(account_id)
+        result = []
+        for pos in positions:
+            sym_id = int(pos.get("tradeData", {}).get("symbolId", 0))
+            try:
+                sym = await self.get_symbol_info(account_id, sym_id)
+                pip_pos = sym.pip_position
+                digs    = sym.digits
+            except Exception:
+                pip_pos = 4
+                digs    = 5
+            result.append(normalize_position(pos, money_digits=money_digits, pip_position=pip_pos, digits=digs))
+        return result
+
+    async def get_pending_orders(
+        self,
+        account_id: int,
+        *,
+        normalize: bool = True,
+        symbol_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Get pending orders, optionally normalized to human-readable form.
+
+        Parameters
+        ----------
+        normalize:
+            If ``True`` (default), return human-readable dicts.
+        symbol_id:
+            If given, filter to orders for a specific symbol.
+        """
+        recon = await self.reconcile(account_id)
+        orders = recon.get("order", [])
+        if symbol_id is not None:
+            orders = [
+                o for o in orders
+                if int(o.get("tradeData", {}).get("symbolId", 0)) == symbol_id
+            ]
+        if not normalize:
+            return orders
+        money_digits = self._get_money_digits(account_id)
+        return normalize_orders(orders, money_digits=money_digits)
+
+    async def get_deal_history(
+        self,
+        account_id: int,
+        *,
+        from_timestamp: int | None = None,
+        to_timestamp: int | None = None,
+        max_rows: int | None = None,
+        normalize: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Get deal/execution history, optionally normalized.
+
+        Each deal dict contains: ``deal_id``, ``position_id``, ``symbol_id``,
+        ``trade_side``, ``volume`` (lots), ``fill_price``, ``commission``,
+        ``swap``, ``close_pnl``, ``time``, ``status``.
+        """
+        resp = await self.get_deal_list(
+            account_id,
+            from_timestamp=from_timestamp,
+            to_timestamp=to_timestamp,
+            max_rows=max_rows,
+        )
+        deals = resp.get("deal", [])
+        if not normalize:
+            return deals
+        money_digits = self._get_money_digits(account_id)
+        return normalize_deals(deals, money_digits=money_digits)
