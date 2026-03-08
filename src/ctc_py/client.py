@@ -34,6 +34,7 @@ from .errors import (
     CTraderRateLimitError,
     CTraderTimeoutError,
     CTraderTradingError,
+    InsufficientMarginError,
     raise_for_error,
 )
 from .events import EventEmitter
@@ -317,6 +318,7 @@ class CTraderClient(EventEmitter):
 
         # Account re-auth tracking: accountId → accessToken
         self._authorized_accounts: dict[int, str] = {}
+        self._account_state_cache: dict[int, dict[str, Any]] = {}
 
         # Background tasks
         self._heartbeat_task: asyncio.Task[None] | None = None
@@ -413,6 +415,7 @@ class CTraderClient(EventEmitter):
         self._stop_heartbeat()
         self._reject_all_pending("Client disconnected")
         self._authorized_accounts.clear()
+        self._account_state_cache.clear()
         self._app_authed = False
 
         if self._recv_task and not self._recv_task.done():
@@ -510,6 +513,7 @@ class CTraderClient(EventEmitter):
                     self._resolve_pending(client_msg_id, error=err)
             else:
                 self._resolve_pending(client_msg_id, result=payload)
+            self._cache_account_state_update(payload_type, payload)
             # Also emit as event if it's a push-type
             event_name = EVENT_NAME.get(payload_type)
             if event_name:
@@ -517,11 +521,24 @@ class CTraderClient(EventEmitter):
             return
 
         # 4. Push event (no pending request matched)
+        self._cache_account_state_update(payload_type, payload)
         event_name = EVENT_NAME.get(payload_type)
         if event_name:
             self.emit(event_name, payload)
         else:
             self.emit(f"payload:{payload_type}", payload)
+
+    def _cache_account_state_update(self, payload_type: int, payload: dict[str, Any]) -> None:
+        """Cache account-state fields from trader update events."""
+        if payload_type != PT.TRADER_UPDATE_EVENT:
+            return
+
+        account_id = int(payload.get("ctidTraderAccountId", 0) or 0)
+        if account_id <= 0:
+            return
+
+        cached = self._account_state_cache.setdefault(account_id, {})
+        cached.update(payload)
 
     # ── Reconnection ────────────────────────────────────────────────
 
@@ -792,12 +809,14 @@ class CTraderClient(EventEmitter):
         if not self._cfg.client_id or not self._cfg.client_secret:
             raise CTraderAuthError("MISSING_CREDENTIALS", "client_id and client_secret are required")
 
+        logger.debug("Authenticating app: clientId=%s env=%s", self._cfg.client_id, self._cfg.env)
         try:
             await self._request(PT.APPLICATION_AUTH_REQ, {
                 "clientId": self._cfg.client_id,
                 "clientSecret": self._cfg.client_secret,
             })
         except CTraderError as e:
+            logger.error("App auth failed: %s (env=%s, clientId=%s)", e, self._cfg.env, self._cfg.client_id)
             raise CTraderAuthError(e.error_code, e.description, e.raw) from e
 
         self._app_authed = True
@@ -1597,6 +1616,226 @@ class CTraderClient(EventEmitter):
         self._set_money_digits(account_id, result["money_digits"])
         return result
 
+    async def _get_expected_margin_value(
+        self,
+        account_id: int,
+        symbol_id: int,
+        volume: int,
+    ) -> float | None:
+        """Return expected margin (deposit currency) for a raw volume.
+
+        Returns ``None`` when margin cannot be determined.
+        """
+        try:
+            resp = await self.get_expected_margin(account_id, symbol_id, [volume])
+            margin_rows = resp.get("margin", []) or []
+            if not margin_rows:
+                return None
+
+            # Prefer exact volume match; otherwise use the first row.
+            row = None
+            for candidate in margin_rows:
+                if int(candidate.get("volume", -1)) == volume:
+                    row = candidate
+                    break
+            if row is None:
+                row = margin_rows[0]
+
+            money_digits = int(resp.get("moneyDigits", self._get_money_digits(account_id)))
+            raw_margin = int(row.get("margin", 0))
+            if raw_margin <= 0:
+                return None
+            return normalize_money(raw_margin, money_digits)
+        except Exception as exc:
+            logger.debug("expected-margin precheck unavailable: %s", exc)
+            return None
+
+    async def _estimate_free_margin(self, account_id: int) -> float | None:
+        """Estimate free margin from balance + unrealized PnL - used margin.
+
+        Returns ``None`` when required account data is unavailable.
+        """
+        cached = self._account_state_cache.get(account_id)
+        if cached:
+            money_digits = int(cached.get("moneyDigits", self._get_money_digits(account_id)))
+            free_margin_raw = cached.get("freeMargin")
+            if free_margin_raw is not None:
+                return normalize_money(int(free_margin_raw), money_digits)
+
+            equity_raw = cached.get("equity")
+            margin_raw = cached.get("margin")
+            if equity_raw is not None and margin_raw is not None:
+                equity = normalize_money(int(equity_raw), money_digits)
+                margin = normalize_money(int(margin_raw), money_digits)
+                return equity - margin
+
+        try:
+            trader = await self.get_trader_info(account_id)
+            money_digits = int(trader.get("money_digits", 2))
+            balance = float(trader.get("balance", 0.0))
+
+            upnl_resp = await self.get_position_unrealized_pnl(account_id)
+            upnl_raw = int(upnl_resp.get("totalUnrealizedPnL", 0))
+            unrealized_pnl = normalize_money(upnl_raw, money_digits)
+
+            recon = await self.reconcile(account_id)
+            used_margin_raw = sum(int(p.get("usedMargin", 0)) for p in recon.get("position", []))
+            used_margin = normalize_money(used_margin_raw, money_digits)
+
+            free_margin = balance + unrealized_pnl - used_margin
+            return free_margin if free_margin >= 0 else None
+        except Exception as exc:
+            logger.debug("free-margin precheck unavailable: %s", exc)
+            return None
+
+    # ── Convenience helpers ───────────────────────────────────────
+
+    async def min_affordable_lots(
+        self,
+        account_id: int,
+        symbol_id: int,
+        *,
+        price: float | None = None,
+        margin_usage_pct: float = 100.0,
+    ) -> float:
+        """Return the smallest size (in lots) that the account can actually afford.
+
+        The returned value will be either ``SymbolInfo.min_lots`` or ``0.0``.
+        A zero result means the account's current free margin is insufficient
+        to open even a minimum‑sized position on the given symbol.  This
+        helper fetches the symbol metadata, estimates free margin, and uses
+        the Open API ``get_expected_margin`` endpoint when available to make
+        the determination.
+
+        Parameters
+        ----------
+        account_id:
+            Authorized trading account.
+        symbol_id:
+            Numeric symbol identifier.
+        price:
+            Market price to use for the calculation.  If ``None`` the latest
+            bid/ask will be fetched via :meth:`get_symbol_price`.
+        margin_usage_pct:
+            Fraction of available margin to consume when computing requirements.
+
+        Returns
+        -------
+        float
+            ``min_lots`` if affordable, otherwise ``0.0``.
+        """
+        sym = await self.get_symbol_info(account_id, symbol_id)
+        free = await self._estimate_free_margin(account_id)
+        if free is None or free <= 0:
+            return 0.0
+
+        # resolve a price if one was not provided
+        if price is None or price <= 0:
+            try:
+                spot = await self.get_symbol_price(sym.symbol_name)
+                price = float(spot.get("ask") or spot.get("bid") or 0)
+            except Exception:
+                price = 0.0
+        if price <= 0:
+            # if we still don't have a price fall back to formula; assume
+            # the symbol is affordable if we have any margin at all.
+            return sym.min_lots if free > 0 else 0.0
+
+        # try API margin calculation for accuracy (handles dynamic leverage)
+        min_vol = sym.lots_to_volume(sym.min_lots)
+        needed = await self._get_expected_margin_value(account_id, symbol_id, min_vol)
+        if needed is not None:
+            return sym.min_lots if needed <= free * (margin_usage_pct / 100.0) else 0.0
+
+        # fallback to simple formula
+        trader = await self.get_trader_info(account_id)
+        leverage = float(trader.get("leverage", 0)) or 0.0
+        required = (sym.min_lots * price * sym.lot_size) / leverage if leverage > 0 else float("inf")
+        usable = free * (margin_usage_pct / 100.0)
+        return sym.min_lots if usable >= required else 0.0
+
+    async def _assert_margin_affordable(
+        self,
+        account_id: int,
+        symbol_id: int,
+        volume: int,
+    ) -> None:
+        """Raise ``InsufficientMarginError`` when order margin is unaffordable.
+
+        This pre-check prevents avoidable broker-side ``NOT_ENOUGH_MONEY``
+        rejections for obviously unaffordable requests.
+        """
+        needed = await self._get_expected_margin_value(account_id, symbol_id, volume)
+        if needed is None:
+            return
+
+        free = await self._estimate_free_margin(account_id)
+        if free is None:
+            return
+
+        if needed > free:
+            raise InsufficientMarginError(
+                "NOT_ENOUGH_MONEY",
+                (
+                    f"Insufficient free margin: required {needed:.2f}, "
+                    f"available {free:.2f}"
+                ),
+                {
+                    "account_id": account_id,
+                    "symbol_id": symbol_id,
+                    "requested_volume": volume,
+                    "required_margin": needed,
+                    "free_margin": free,
+                },
+            )
+
+    async def _retry_with_lower_volume_on_margin_error(
+        self,
+        *,
+        sym: SymbolInfo,
+        requested_volume: int,
+        place_with_volume: Callable[[int], Coroutine[Any, Any, dict[str, Any]]],
+    ) -> dict[str, Any]:
+        """Retry an order with reduced volume when funds are insufficient.
+
+        Uses geometric reductions and snaps to symbol step/min constraints.
+        Raises the last :class:`InsufficientMarginError` if every retry fails.
+        """
+        step_volume = max(1, sym.lots_to_volume(sym.step_lots))
+        min_volume = max(1, sym.lots_to_volume(sym.min_lots))
+
+        current = requested_volume
+        last_error: InsufficientMarginError | None = None
+
+        while current > min_volume:
+            reduced = current // 2
+            reduced = (reduced // step_volume) * step_volume
+            if reduced < min_volume:
+                reduced = min_volume
+            if reduced >= current:
+                reduced = current - step_volume
+            if reduced < min_volume:
+                break
+
+            logger.warning(
+                "Insufficient margin for volume=%d; retrying with reduced volume=%d",
+                current,
+                reduced,
+            )
+
+            try:
+                return await place_with_volume(reduced)
+            except InsufficientMarginError as exc:
+                last_error = exc
+                current = reduced
+
+        if last_error is not None:
+            raise last_error
+        raise InsufficientMarginError(
+            "NOT_ENOUGH_MONEY",
+            "Insufficient margin even at minimum allowed volume",
+        )
+
     # ══════════════════════════════════════════════════════════════════
     #  SMART TRADING ORDERS  (lots + pips, no raw values required)
     # ══════════════════════════════════════════════════════════════════
@@ -1611,6 +1850,7 @@ class CTraderClient(EventEmitter):
         sl_pips: float | None = None,
         tp_pips: float | None = None,
         comment: str | None = None,
+        auto_reduce_volume_on_margin: bool = True,
         **extra: Any,
     ) -> dict[str, Any]:
         """Place a market order using **lots** and **pip distances**.
@@ -1648,28 +1888,32 @@ class CTraderClient(EventEmitter):
         """
         sym = await self.get_symbol_info(account_id, symbol_id)
         volume = sym.snap_volume(lots)
+        await self._assert_margin_affordable(account_id, symbol_id, volume)
         params: dict[str, Any] = {}
         if comment is not None:
             params["comment"] = comment
 
-        # SL/TP: we need the entry price — subscribe momentarily to get a spot
-        if sl_pips is not None or tp_pips is not None:
-            await self.subscribe_spots(account_id, [symbol_id])
-            spot = await self.wait_for("spot", timeout=10.0)
-            await self.unsubscribe_spots(account_id, [symbol_id])
-            # BUY fills at ask, SELL fills at bid
-            entry_raw = int(spot.get("ask", 0)) if trade_side == 1 else int(spot.get("bid", 0))
-            sltp = sym.sl_tp_prices(
-                normalize_price(entry_raw), trade_side,
-                sl_pips=sl_pips, tp_pips=tp_pips,
-            )
-            if sltp.get("stopLoss") is not None:
-                params["stopLoss"] = sltp["stopLoss"]
-            if sltp.get("takeProfit") is not None:
-                params["takeProfit"] = sltp["takeProfit"]
+        # SL/TP: for MARKET orders cTrader requires *relative* distances
+        # (relativeStopLoss / relativeTakeProfit in raw price units), not
+        # absolute prices.  Using absolute stopLoss/takeProfit raises
+        # INVALID_REQUEST for MARKET order types.
+        if sl_pips is not None:
+            params["relativeStopLoss"] = sym.pips_to_raw(sl_pips)
+        if tp_pips is not None:
+            params["relativeTakeProfit"] = sym.pips_to_raw(tp_pips)
 
         params.update(extra)
-        return await self.market_order(account_id, symbol_id, trade_side, volume, **params)
+
+        try:
+            return await self.market_order(account_id, symbol_id, trade_side, volume, **params)
+        except InsufficientMarginError:
+            if not auto_reduce_volume_on_margin:
+                raise
+            return await self._retry_with_lower_volume_on_margin_error(
+                sym=sym,
+                requested_volume=volume,
+                place_with_volume=lambda v: self.market_order(account_id, symbol_id, trade_side, v, **params),
+            )
 
     async def smart_limit_order(
         self,
@@ -1682,6 +1926,7 @@ class CTraderClient(EventEmitter):
         sl_pips: float | None = None,
         tp_pips: float | None = None,
         comment: str | None = None,
+        auto_reduce_volume_on_margin: bool = True,
         **extra: Any,
     ) -> dict[str, Any]:
         """Place a limit order using **lots** (not raw volume) and **pip distances**.
@@ -1695,6 +1940,7 @@ class CTraderClient(EventEmitter):
         """
         sym = await self.get_symbol_info(account_id, symbol_id)
         volume = sym.snap_volume(lots)
+        await self._assert_margin_affordable(account_id, symbol_id, volume)
         sltp = sym.sl_tp_prices(limit_price, trade_side, sl_pips=sl_pips, tp_pips=tp_pips)
         params: dict[str, Any] = {}
         if comment is not None:
@@ -1704,11 +1950,24 @@ class CTraderClient(EventEmitter):
         if sltp.get("takeProfit") is not None:
             params["takeProfit"] = sltp["takeProfit"]
         params.update(extra)
-        return await self.limit_order(
-            account_id, symbol_id, trade_side, volume,
-            price_to_raw(limit_price),
-            **params,
-        )
+
+        limit_price_raw = price_to_raw(limit_price)
+        try:
+            return await self.limit_order(
+                account_id, symbol_id, trade_side, volume,
+                limit_price_raw,
+                **params,
+            )
+        except InsufficientMarginError:
+            if not auto_reduce_volume_on_margin:
+                raise
+            return await self._retry_with_lower_volume_on_margin_error(
+                sym=sym,
+                requested_volume=volume,
+                place_with_volume=lambda v: self.limit_order(
+                    account_id, symbol_id, trade_side, v, limit_price_raw, **params
+                ),
+            )
 
     async def smart_stop_order(
         self,
@@ -1721,6 +1980,7 @@ class CTraderClient(EventEmitter):
         sl_pips: float | None = None,
         tp_pips: float | None = None,
         comment: str | None = None,
+        auto_reduce_volume_on_margin: bool = True,
         **extra: Any,
     ) -> dict[str, Any]:
         """Place a stop order using **lots** and **pip distances**.
@@ -1734,6 +1994,7 @@ class CTraderClient(EventEmitter):
         """
         sym = await self.get_symbol_info(account_id, symbol_id)
         volume = sym.snap_volume(lots)
+        await self._assert_margin_affordable(account_id, symbol_id, volume)
         sltp = sym.sl_tp_prices(stop_price, trade_side, sl_pips=sl_pips, tp_pips=tp_pips)
         params: dict[str, Any] = {}
         if comment is not None:
@@ -1743,11 +2004,24 @@ class CTraderClient(EventEmitter):
         if sltp.get("takeProfit") is not None:
             params["takeProfit"] = sltp["takeProfit"]
         params.update(extra)
-        return await self.stop_order(
-            account_id, symbol_id, trade_side, volume,
-            price_to_raw(stop_price),
-            **params,
-        )
+
+        stop_price_raw = price_to_raw(stop_price)
+        try:
+            return await self.stop_order(
+                account_id, symbol_id, trade_side, volume,
+                stop_price_raw,
+                **params,
+            )
+        except InsufficientMarginError:
+            if not auto_reduce_volume_on_margin:
+                raise
+            return await self._retry_with_lower_volume_on_margin_error(
+                sym=sym,
+                requested_volume=volume,
+                place_with_volume=lambda v: self.stop_order(
+                    account_id, symbol_id, trade_side, v, stop_price_raw, **params
+                ),
+            )
 
     async def smart_set_sl_tp(
         self,

@@ -264,6 +264,21 @@ class TestSymbolDomainObject:
         assert result["tp_valid"] is True
         assert result["all_valid"] is True
 
+    def test_lots_for_margin_unaffordable_returns_zero(self):
+        info = _make_sym_info(min_lots=0.1, lot_size=100_000)
+        # choose parameters so that available margin can't even cover min_lots
+        lots = info.lots_for_margin(available_margin=1.0, price=1000.0, leverage=10)
+        assert lots == 0.0
+
+    def test_min_max_affordable_lots_helpers(self):
+        info = _make_sym_info(min_lots=0.1, lot_size=100_000)
+        # insufficient margin: both helpers should return zero
+        assert info.min_affordable_lots(available_margin=1.0, price=1000.0, leverage=10) == 0.0
+        assert info.max_affordable_lots(available_margin=1.0, price=1000.0, leverage=10) == 0.0
+        # generous margin: should at least return the declared minimum
+        assert info.min_affordable_lots(available_margin=10_000.0, price=1.0, leverage=100) == pytest.approx(0.1)
+        assert info.max_affordable_lots(available_margin=10_000.0, price=1.0, leverage=100) >= 0.1
+
     @pytest.mark.asyncio
     async def test_buy_delegates_to_smart_market_order(self):
         info = _make_sym_info()

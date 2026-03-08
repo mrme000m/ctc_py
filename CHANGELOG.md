@@ -365,6 +365,26 @@ client.on("reconnected", lambda info: print("Back online!"))
 client.on("state_change", lambda s: print(s["state"]))
 ```
 
+### Margin affordability helpers and improved sizing
+
+- **SymbolInfo**
+  * Added ``min_affordable_lots`` and ``max_affordable_lots`` helpers that
+    incorporate available margin and return ``0.0`` when the account cannot
+    afford the symbol's minimum size.
+  * ``lots_for_margin`` now returns ``0.0`` instead of snapping up to
+    ``min_lots`` when margin is insufficient.  This prevents callers from
+    using an impossible minimum size and getting ``NOT_ENOUGH_MONEY``
+    rejections.
+
+- **CTraderClient**
+  * New ``min_affordable_lots`` convenience method (async) that fetches
+    symbol info, estimates free margin, and even queries the Open API's
+    ``EXPECTED_MARGIN`` endpoint to determine whether the min lot is
+    affordable.  Returns ``0.0`` when not.
+  * ``calculate_safe_volume`` now uses ``max_affordable_lots`` and returns
+    ``0.0`` when no volume is affordable, rather than forcing the minimum
+    lot and provoking broker errors.
+
 ### Replace calculate_safe_volume patterns
 
 ```python

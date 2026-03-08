@@ -301,7 +301,9 @@ sym_info = await client.get_symbol_info_by_name(account_id, "EURUSD")
 | `sym_info.snap_lots(lots)` | Clamp to min/step/max |
 | `sym_info.validate_lots(lots)` | → `(bool, reason)` |
 | `sym_info.lots_for_risk(balance, risk%, sl_pips)` | Risk-based sizing |
-| `sym_info.lots_for_margin(margin, price, leverage)` | Margin-based sizing |
+| `sym_info.lots_for_margin(margin, price, leverage)` | Margin-based sizing (returns 0 when even the minimum lot is unaffordable) |
+| `sym_info.min_affordable_lots(margin, price, leverage)` | Returns minimum lot if affordable, else 0 |
+| `sym_info.max_affordable_lots(margin, price, leverage)` | Upper bound that returns 0 when unaffordable |
 | `sym_info.sl_tp_prices(entry, side, *, sl_pips, tp_pips)` | → `{stopLoss, takeProfit}` floats |
 | `sym_info.sl_tp_raw(entry_raw, side, *, sl_pips, tp_pips)` | → `{stopLoss, takeProfit}` raw ints |
 

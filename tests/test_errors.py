@@ -152,6 +152,7 @@ class TestRaiseForError:
         ("NOT_SUBSCRIBED",               NotSubscribedError),
         ("INSUFFICIENT_MARGIN",          InsufficientMarginError),
         ("ACCOUNTS_DO_NOT_HAVE_MARGIN",  InsufficientMarginError),
+        ("NOT_ENOUGH_MONEY",             InsufficientMarginError),
         ("SYMBOL_NOT_FOUND",             InvalidSymbolError),
         ("TRADING_DISABLED",             TradingDisabledError),
         ("MARKET_CLOSED",                MarketClosedError),

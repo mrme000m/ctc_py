@@ -282,6 +282,18 @@ class SymbolInfo:
             lots = (available_margin × margin_usage% / 100 × leverage)
                    / (price × lot_size)
 
+        By historical convention this helper snapped the result up to
+        ``min_lots`` even when the account could not actually afford that
+        minimum size.  That behaviour led to confusing ``NOT_ENOUGH_MONEY``
+        rejections when callers blindly used the value for order placement.
+
+        The updated implementation still snaps to step/min/max when the
+        raw calculation yields a sensible lot size, but **returns ``0.0``
+        if the available margin is insufficient to cover even the
+        ``min_lots`` requirement**.  This makes it easy to detect when a
+        symbol is unaffordable and avoids accidentally suggesting a
+        non‑viable minimum position.
+
         Parameters
         ----------
         available_margin:
@@ -299,7 +311,76 @@ class SymbolInfo:
             return 0.0
         usable = available_margin * margin_usage_pct / 100.0
         lots = (usable * leverage) / (price * self.lot_size)
-        return self.snap_lots(lots) if snap else lots
+        if snap:
+            # If the raw calculated volume is below the minimum, the account
+            # cannot actually afford even a single step – return zero rather
+            # than snapping up to `min_lots`.
+            if lots < self.min_lots:
+                return 0.0
+            snapped = self.snap_lots(lots)
+            return snapped
+        else:
+            return lots
+
+
+    # ── Affordability helpers ───────────────────────────────────────
+
+    def min_affordable_lots(
+        self,
+        available_margin: float,
+        price: float,
+        leverage: float,
+        *,
+        margin_usage_pct: float = 100.0,
+    ) -> float:
+        """Return the smallest lot size the account can actually afford.
+
+        This differs from :meth:`lots_for_margin` in that it will return
+        ``0.0`` when free margin is insufficient to support the symbol's
+        declared ``min_lots``.  A result of ``0.0`` signals that no trade
+        can currently be opened on this instrument with the given funds.
+
+        Parameters
+        ----------
+        available_margin:
+            Free margin in deposit currency.
+        price:
+            Current market price (human float).
+        leverage:
+            Effective leverage ratio to apply.
+        margin_usage_pct:
+            Fraction of margin to consume (default 100).
+        """
+        if price <= 0 or leverage <= 0 or self.lot_size <= 0:
+            return 0.0
+        usable = available_margin * margin_usage_pct / 100.0
+        required = (self.min_lots * price * self.lot_size) / leverage
+        return self.min_lots if usable >= required else 0.0
+
+    def max_affordable_lots(
+        self,
+        available_margin: float,
+        price: float,
+        leverage: float,
+        *,
+        margin_usage_pct: float = 100.0,
+        snap: bool = True,
+    ) -> float:
+        """Shadow of :meth:`lots_for_margin` that returns zero if the
+        symbol is unaffordable.
+
+        This helper is mainly a convenience for callers who only care about
+        the upper bound and do not want to worry about minimum‑lot
+        behaviour.  The implementation simply delegates to
+        :meth:`lots_for_margin` and then zeroes the result when it falls
+        below ``min_lots``.
+        """
+        lots = self.lots_for_margin(
+            available_margin, price, leverage,
+            margin_usage_pct=margin_usage_pct,
+            snap=snap,
+        )
+        return lots if lots >= self.min_lots else 0.0
 
     # ── SL / TP price computation ────────────────────────────────────
 

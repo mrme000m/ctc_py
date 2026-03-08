@@ -39,6 +39,71 @@ def _minutes_to_dt(minutes: int | None) -> datetime | None:
     return datetime.fromtimestamp(int(minutes) * 60, tz=timezone.utc)
 
 
+_TRADE_SIDE_MAP = {
+    "BUY": 1,
+    "SELL": 2,
+}
+
+_POSITION_STATUS_MAP = {
+    "POSITION_STATUS_OPEN": 1,
+    "POSITION_STATUS_CLOSED": 2,
+    "POSITION_STATUS_CREATED": 3,
+    "POSITION_STATUS_ERROR": 4,
+}
+
+_ORDER_TYPE_MAP = {
+    "MARKET": 1,
+    "LIMIT": 2,
+    "STOP": 3,
+    "STOP_LOSS_TAKE_PROFIT": 4,
+    "MARKET_RANGE": 5,
+    "STOP_LIMIT": 6,
+}
+
+_ORDER_STATUS_MAP = {
+    "ORDER_STATUS_ACCEPTED": 1,
+    "ORDER_STATUS_FILLED": 2,
+    "ORDER_STATUS_REJECTED": 3,
+    "ORDER_STATUS_EXPIRED": 4,
+    "ORDER_STATUS_CANCELLED": 5,
+}
+
+_DEAL_STATUS_MAP = {
+    "FILLED": 2,
+    "PARTIALLY_FILLED": 3,
+    "REJECTED": 4,
+    "INTERNALLY_REJECTED": 5,
+    "ERROR": 6,
+    "MISSED": 7,
+}
+
+_EXECUTION_TYPE_MAP = {
+    "ORDER_ACCEPTED": 2,
+    "ORDER_FILLED": 3,
+    "ORDER_REPLACED": 4,
+    "ORDER_CANCELLED": 5,
+    "ORDER_EXPIRED": 6,
+    "ORDER_REJECTED": 7,
+    "ORDER_CANCEL_REJECTED": 8,
+    "SWAP": 9,
+    "DEPOSIT_WITHDRAW": 10,
+    "ORDER_PARTIAL_FILL": 11,
+    "BONUS_DEPOSIT_WITHDRAW": 12,
+}
+
+
+def _enum_to_int(value: Any, mapping: dict[str, int], default: int = 0) -> int:
+    """Normalize either numeric or string enum values to the canonical int."""
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.isdigit():
+            return int(stripped)
+        return mapping.get(stripped.upper(), default)
+    return default
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Trendbar (OHLCV candle)
 # ──────────────────────────────────────────────────────────────────────
@@ -143,8 +208,35 @@ def normalize_tick(tick: dict[str, Any], *, digits: int = 5) -> dict[str, Any]:
 
 
 def normalize_ticks(ticks: list[dict[str, Any]], *, digits: int = 5) -> list[dict[str, Any]]:
-    """Normalize a list of raw tick dicts."""
-    return [normalize_tick(t, digits=digits) for t in ticks]
+    """Normalize a list of raw tick dicts.
+
+    cTrader historical ticks are delta-encoded in descending order: the first
+    row is absolute and each subsequent row stores deltas from the previous
+    tick for both timestamp and price.
+    """
+    normalized: list[dict[str, Any]] = []
+    running_timestamp: int | None = None
+    running_tick: int | None = None
+
+    for tick in ticks:
+        timestamp_value = int(tick.get("timestamp", 0))
+        tick_value = int(tick.get("tick", 0))
+
+        if running_timestamp is None:
+            running_timestamp = timestamp_value
+            running_tick = tick_value
+        else:
+            running_timestamp += timestamp_value
+            running_tick = (running_tick or 0) + tick_value
+
+        normalized.append({
+            "time": _ms_to_dt(running_timestamp),
+            "timestamp_ms": running_timestamp,
+            "price": normalize_price(running_tick or 0),
+            "digits": digits,
+        })
+
+    return normalized
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -232,7 +324,7 @@ def normalize_position(pos: dict[str, Any], *, money_digits: int = 2, pip_positi
     return {
         "position_id":  int(pos.get("positionId", 0)),
         "symbol_id":    int(td.get("symbolId", 0)),
-        "trade_side":   int(td.get("tradeSide", 0)),
+        "trade_side":   _enum_to_int(td.get("tradeSide", 0), _TRADE_SIDE_MAP),
         "volume":       normalize_lots(vol_raw),
         "volume_raw":   vol_raw,
         "entry_price":  normalize_price(entry_raw),
@@ -241,7 +333,7 @@ def normalize_position(pos: dict[str, Any], *, money_digits: int = 2, pip_positi
         "swap":         normalize_money(swap_raw, money_digits),
         "commission":   normalize_money(comm_raw, money_digits),
         "open_time":    _ms_to_dt(int(open_ts)) if open_ts else None,
-        "status":       int(pos.get("positionStatus", 0)),
+        "status":       _enum_to_int(pos.get("positionStatus", 0), _POSITION_STATUS_MAP),
         "digits":       digits,
     }
 
@@ -295,8 +387,8 @@ def normalize_order(order: dict[str, Any], *, money_digits: int = 2, digits: int
         "order_id":    int(order.get("orderId", 0)),
         "position_id": order.get("positionId"),
         "symbol_id":   int(td.get("symbolId", 0)),
-        "order_type":  int(order.get("orderType", 0)),
-        "trade_side":  int(td.get("tradeSide", 0)),
+        "order_type":  _enum_to_int(order.get("orderType", 0), _ORDER_TYPE_MAP),
+        "trade_side":  _enum_to_int(td.get("tradeSide", 0), _TRADE_SIDE_MAP),
         "volume":      normalize_lots(vol_raw),
         "volume_raw":  vol_raw,
         "limit_price": normalize_price(int(lp_raw)) if lp_raw is not None else None,
@@ -305,7 +397,7 @@ def normalize_order(order: dict[str, Any], *, money_digits: int = 2, digits: int
         "take_profit": normalize_price(int(tp_raw)) if tp_raw is not None else None,
         "expiry_time": _ms_to_dt(int(exp_ts)) if exp_ts else None,
         "comment":     td.get("comment", ""),
-        "status":      int(order.get("orderStatus", 0)),
+        "status":      _enum_to_int(order.get("orderStatus", 0), _ORDER_STATUS_MAP),
         "digits":      digits,
     }
 
@@ -352,7 +444,7 @@ def normalize_deal(deal: dict[str, Any], *, money_digits: int = 2, digits: int =
         "position_id": int(deal.get("positionId", 0)),
         "order_id":    int(deal.get("orderId", 0)),
         "symbol_id":   int(deal.get("symbolId", 0)),
-        "trade_side":  int(deal.get("tradeSide", 0)),
+        "trade_side":  _enum_to_int(deal.get("tradeSide", 0), _TRADE_SIDE_MAP),
         "volume":      normalize_lots(vol_raw),
         "volume_raw":  vol_raw,
         "fill_price":  normalize_price(exec_price_raw),
@@ -360,7 +452,7 @@ def normalize_deal(deal: dict[str, Any], *, money_digits: int = 2, digits: int =
         "swap":        normalize_money(swap_raw, money_digits),
         "close_pnl":   normalize_money(int(close_pnl_raw), money_digits) if close_pnl_raw is not None else None,
         "time":        _ms_to_dt(int(create_ts)) if create_ts else None,
-        "status":      int(deal.get("dealStatus", 0)),
+        "status":      _enum_to_int(deal.get("dealStatus", 0), _DEAL_STATUS_MAP),
         "digits":      digits,
     }
 
@@ -390,16 +482,41 @@ def normalize_execution(event: dict[str, Any], *, money_digits: int = 2, digits:
     raw_deal  = event.get("deal")
 
     return {
-        "execution_type": int(event.get("executionType", 0)),
+        "execution_type": _enum_to_int(event.get("executionType", 0), _EXECUTION_TYPE_MAP),
         "position":       normalize_position(raw_pos, money_digits=money_digits, pip_position=pip_position, digits=digits) if raw_pos else None,
         "order":          normalize_order(raw_order, money_digits=money_digits, digits=digits) if raw_order else None,
         "deal":           normalize_deal(raw_deal, money_digits=money_digits, digits=digits) if raw_deal else None,
+        "is_server_event": bool(event.get("isServerEvent", False)),
+        "error_code":     event.get("errorCode"),
     }
 
 
 # ──────────────────────────────────────────────────────────────────────
 # Trader / account
 # ──────────────────────────────────────────────────────────────────────
+
+# Enum mappings for string-to-int conversion
+_ACCOUNT_TYPE_MAP = {
+    "HEDGED": 0,
+    "NETTED": 1,
+    "SPREAD_BETTING": 2,
+}
+
+_ACCESS_RIGHTS_MAP = {
+    "FULL_ACCESS": 0,
+    "CLOSE_ONLY": 1,
+    "NO_TRADING": 2,
+}
+
+
+def _normalize_enum(value: Any, mapping: dict[str, int], default: int = 0) -> int:
+    """Normalize enum value to int (handles both int and string values)."""
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        return mapping.get(value.upper(), default)
+    return default
+
 
 def normalize_trader(trader_resp: dict[str, Any]) -> dict[str, Any]:
     """Normalize a raw trader response (from ``get_trader``).
@@ -424,12 +541,12 @@ def normalize_trader(trader_resp: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "account_id":        int(trader.get("ctidTraderAccountId", 0)),
-        "account_type":      int(trader.get("accountType", 0)),
+        "account_type":      _normalize_enum(trader.get("accountType", 0), _ACCOUNT_TYPE_MAP),
         "balance":           normalize_money(balance_raw, money_digits),
         "money_digits":      money_digits,
         "leverage":          lev_cents / 100.0,
         "leverage_in_cents": lev_cents,
         "deposit_asset_id":  int(trader.get("depositAssetId", 0)),
-        "access_rights":     int(trader.get("accessRights", 0)),
+        "access_rights":     _normalize_enum(trader.get("accessRights", 0), _ACCESS_RIGHTS_MAP),
         "is_live":           bool(trader.get("isLive", False)),
     }

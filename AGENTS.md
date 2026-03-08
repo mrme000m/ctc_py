@@ -552,6 +552,9 @@ sym = (await account.symbol("EURUSD")).info
 | `sym.snap_volume(lots)` | `int` | snap + convert to raw volume |
 | `sym.validate_lots(lots)` | `tuple[bool, str]` | (valid, reason) |
 | `sym.lots_for_risk(balance, risk%, sl_pips)` | `float` | risk-based sizing |
+| `sym.lots_for_margin(margin, price, leverage)` | `float` | margin-based sizing (0 when unaffordable) |
+| `sym.min_affordable_lots(margin, price, leverage)` | `float` | returns min lots or 0 if insufficient |
+| `sym.max_affordable_lots(margin, price, leverage)` | `float` | upper bound that returns 0 when unaffordable |
 | `sym.lots_for_margin(margin, price, leverage)` | `float` | margin-based sizing |
 | `sym.sl_tp_prices(entry, side, sl_pips, tp_pips)` | `dict` | → float SL/TP |
 | `sym.sl_tp_raw(entry_raw, side, sl_pips, tp_pips)` | `dict` | → raw int SL/TP |
