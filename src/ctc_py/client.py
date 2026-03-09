@@ -1203,7 +1203,9 @@ class CTraderClient(EventEmitter):
         results = []
         for pos in recon.get("position", []):
             try:
-                vol = pos.get("tradeData", {}).get("volume", 0)
+                # volume may be returned as a string from the API; always
+                # convert to int before comparing or passing to RPC methods.
+                vol = int(pos.get("tradeData", {}).get("volume", 0))
                 if vol > 0:
                     r = await self.close_position(account_id, int(pos["positionId"]), vol)
                     results.append(r)

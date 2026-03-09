@@ -131,6 +131,23 @@ async def test_smart_set_sl_tp_sends_normalized_prices():
     )
 
 
+@pytest.mark.asyncio
+async def test_close_all_positions_string_volume():
+    """Ensure close_all_positions can handle volumes returned as strings."""
+    client = _make_client()
+    client.reconcile = AsyncMock(return_value={
+        "position": [
+            {"positionId": 42, "tradeData": {"volume": "1500"}},
+            {"positionId": 43, "tradeData": {"volume": 0}},
+        ]
+    })
+    client.close_position = AsyncMock(return_value={"ok": True})
+
+    results = await client.close_all_positions(1)
+    assert results == [{"ok": True}]
+    client.close_position.assert_awaited_once_with(1, 42, 1500)
+
+
 
 @pytest.mark.asyncio
 async def test_min_affordable_lots_helper_returns_zero_on_low_margin():

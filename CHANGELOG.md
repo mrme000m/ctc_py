@@ -154,6 +154,8 @@ All new methods are on `CTraderClient`:
 | `smart_set_sl_tp(…, entry_price, trade_side, sl_pips, tp_pips)` | Set SL/TP by pips |
 
 > **Bug fix:** prior releases erroneously converted the normalized SL/TP floats back to raw integers; values are now forwarded unchanged.
+
+> **Bug fix:** `close_all_positions()` now casts `tradeData.volume` to an integer before comparing/using it. API responses sometimes returned the volume as a string.
 | `smart_close_position(…, lots)` | Close by lots |
 | `risk_market_order(…, risk_percent, sl_pips)` | Auto-sized market order |
 | `get_bars(…)` | Normalized OHLCV list |
