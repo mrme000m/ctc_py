@@ -28,6 +28,7 @@ def _make_client() -> CTraderClient:
 
 def _make_symbol() -> MagicMock:
     sym = MagicMock()
+    sym.digits = 5
     sym.snap_volume.return_value = 1000
     sym.pips_to_raw.side_effect = lambda p: int(p * 10)
     sym.sl_tp_prices.return_value = {"stopLoss": None, "takeProfit": None}

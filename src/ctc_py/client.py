@@ -1957,12 +1957,12 @@ class CTraderClient(EventEmitter):
         if comment is not None:
             params["comment"] = comment
         if sltp.get("stopLoss") is not None:
-            params["stopLoss"] = sltp["stopLoss"]
+            params["stopLoss"] = price_to_raw(sltp["stopLoss"], digits=sym.digits)
         if sltp.get("takeProfit") is not None:
-            params["takeProfit"] = sltp["takeProfit"]
+            params["takeProfit"] = price_to_raw(sltp["takeProfit"], digits=sym.digits)
         params.update(extra)
 
-        limit_price_raw = price_to_raw(limit_price)
+        limit_price_raw = price_to_raw(limit_price, digits=sym.digits)
         try:
             return await self.limit_order(
                 account_id, symbol_id, trade_side, volume,
@@ -2011,12 +2011,12 @@ class CTraderClient(EventEmitter):
         if comment is not None:
             params["comment"] = comment
         if sltp.get("stopLoss") is not None:
-            params["stopLoss"] = sltp["stopLoss"]
+            params["stopLoss"] = price_to_raw(sltp["stopLoss"], digits=sym.digits)
         if sltp.get("takeProfit") is not None:
-            params["takeProfit"] = sltp["takeProfit"]
+            params["takeProfit"] = price_to_raw(sltp["takeProfit"], digits=sym.digits)
         params.update(extra)
 
-        stop_price_raw = price_to_raw(stop_price)
+        stop_price_raw = price_to_raw(stop_price, digits=sym.digits)
         try:
             return await self.stop_order(
                 account_id, symbol_id, trade_side, volume,
@@ -2063,8 +2063,8 @@ class CTraderClient(EventEmitter):
         # sltp returns human-readable floats; convert to raw integers
         # before sending to the protocol which expects prices in 1/100000
         params = filter_none({
-            "stopLoss":   price_to_raw(sltp.get("stopLoss")) if sltp.get("stopLoss") is not None else None,
-            "takeProfit": price_to_raw(sltp.get("takeProfit")) if sltp.get("takeProfit") is not None else None,
+            "stopLoss":   price_to_raw(sltp.get("stopLoss"), digits=sym.digits) if sltp.get("stopLoss") is not None else None,
+            "takeProfit": price_to_raw(sltp.get("takeProfit"), digits=sym.digits) if sltp.get("takeProfit") is not None else None,
         })
         return await self.amend_position_sltp(account_id, position_id, **params)
 
@@ -2126,7 +2126,7 @@ class CTraderClient(EventEmitter):
             params["volume"] = sym.snap_volume(lots)
 
         if price is not None:
-            params["limitPrice"] = price_to_raw(price)
+            params["limitPrice"] = price_to_raw(price, digits=sym.digits)
 
         if sl_pips is not None or tp_pips is not None:
             # Use provided price or fall back to current order price via reconcile
@@ -2137,7 +2137,7 @@ class CTraderClient(EventEmitter):
                     order_detail = await self.get_order_details(account_id, order_id)
                     raw_lp = order_detail.get("limitPrice") or order_detail.get("stopPrice")
                     if raw_lp:
-                        anchor_price = normalize_price(int(raw_lp))
+                        anchor_price = normalize_price(int(raw_lp), sym.digits)
                 except Exception:
                     pass
 
@@ -2147,9 +2147,9 @@ class CTraderClient(EventEmitter):
                     sl_pips=sl_pips, tp_pips=tp_pips,
                 )
                 if sltp.get("stopLoss") is not None:
-                    params["stopLoss"] = price_to_raw(sltp["stopLoss"])
+                    params["stopLoss"] = price_to_raw(sltp["stopLoss"], digits=sym.digits)
                 if sltp.get("takeProfit") is not None:
-                    params["takeProfit"] = price_to_raw(sltp["takeProfit"])
+                    params["takeProfit"] = price_to_raw(sltp["takeProfit"], digits=sym.digits)
             else:
                 logger.warning(
                     "smart_amend_order: could not determine anchor price for SL/TP; "
@@ -2362,7 +2362,16 @@ class CTraderClient(EventEmitter):
         if not normalize:
             return orders
         money_digits = self._get_money_digits(account_id)
-        return normalize_orders(orders, money_digits=money_digits)
+        result = []
+        for order in orders:
+            sym_id = int(order.get("tradeData", {}).get("symbolId", 0))
+            try:
+                sym = await self.get_symbol_info(account_id, sym_id)
+                digs = sym.digits
+            except Exception:
+                digs = 5
+            result.append(normalize_order(order, money_digits=money_digits, digits=digs))
+        return result
 
     async def get_deal_history(
         self,
@@ -2389,4 +2398,13 @@ class CTraderClient(EventEmitter):
         if not normalize:
             return deals
         money_digits = self._get_money_digits(account_id)
-        return normalize_deals(deals, money_digits=money_digits)
+        result = []
+        for deal in deals:
+            sym_id = int(deal.get("symbolId", 0))
+            try:
+                sym = await self.get_symbol_info(account_id, sym_id)
+                digs = sym.digits
+            except Exception:
+                digs = 5
+            result.append(normalize_deal(deal, money_digits=money_digits, digits=digs))
+        return result

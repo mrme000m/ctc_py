@@ -275,7 +275,7 @@ def normalize_spot(spot: dict[str, Any], *, digits: int = 5, pip_position: int =
     ask = normalize_price(int(ask_raw), digits) if ask_raw is not None else None
     mid = (bid + ask) / 2 if bid is not None and ask is not None else None
     spread_pips = (
-        raw_to_pips(int(ask_raw) - int(bid_raw), pip_position)
+        raw_to_pips(int(ask_raw) - int(bid_raw), pip_position, digits)
         if bid_raw is not None and ask_raw is not None
         else None
     )
@@ -476,7 +476,9 @@ def normalize_order(order: dict[str, Any], *, money_digits: int = 2, digits: int
     return normalized
 
 
-def normalize_orders(orders: list[dict[str, Any]], *, money_digits: int = 2, digits: int = 5) -> list[dict[str, Any]]:
+def normalize_orders(
+    orders: list[dict[str, Any]], *, money_digits: int = 2, digits: int = 5
+) -> list[dict[str, Any]]:
     """Normalize a list of raw order dicts."""
     return [normalize_order(o, money_digits=money_digits, digits=digits) for o in orders]
 
