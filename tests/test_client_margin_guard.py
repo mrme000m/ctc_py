@@ -87,6 +87,52 @@ async def test_smart_market_order_sends_when_affordable():
 
 
 @pytest.mark.asyncio
+async def test_smart_set_sl_tp_sends_normalized_prices():
+    """Verify that SL/TP floats are forwarded without extra scaling."""
+    client = _make_client()
+    sym = _make_symbol()
+
+    # return some realistic float values from sl_tp_prices
+    sym.sl_tp_prices.return_value = {"stopLoss": 1.15098, "takeProfit": 1.15500}
+    client.get_symbol_info = AsyncMock(return_value=sym)  # type: ignore[method-assign]
+    client.amend_position_sltp = AsyncMock(return_value={"ok": True})  # type: ignore[method-assign]
+
+    result = await client.smart_set_sl_tp(
+        1, 12345,
+        entry_price=1.15,
+        trade_side=1,
+        symbol_id=100,
+        sl_pips=50,
+        tp_pips=100,
+    )
+
+    assert result == {"ok": True}
+    client.amend_position_sltp.assert_awaited_once_with(
+        1, 12345,
+        stopLoss=1.15098,
+        takeProfit=1.15500,
+    )
+
+    # also try sending only one side; filter_none should omit the other key
+    sym.sl_tp_prices.return_value = {"stopLoss": None, "takeProfit": 1.20000}
+    client.amend_position_sltp.reset_mock()
+    result2 = await client.smart_set_sl_tp(
+        1, 999,
+        entry_price=1.19,
+        trade_side=2,
+        symbol_id=100,
+        sl_pips=None,
+        tp_pips=50,
+    )
+    assert result2 == {"ok": True}
+    client.amend_position_sltp.assert_awaited_once_with(
+        1, 999,
+        takeProfit=1.20000,
+    )
+
+
+
+@pytest.mark.asyncio
 async def test_min_affordable_lots_helper_returns_zero_on_low_margin():
     client = _make_client()
     sym = _make_symbol()

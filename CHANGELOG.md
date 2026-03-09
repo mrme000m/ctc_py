@@ -152,6 +152,8 @@ All new methods are on `CTraderClient`:
 | `smart_limit_order(…, lots, price, sl_pips, tp_pips)` | Limit order |
 | `smart_stop_order(…, lots, price, sl_pips, tp_pips)` | Stop order |
 | `smart_set_sl_tp(…, entry_price, trade_side, sl_pips, tp_pips)` | Set SL/TP by pips |
+
+> **Bug fix:** prior releases erroneously converted the normalized SL/TP floats back to raw integers; values are now forwarded unchanged.
 | `smart_close_position(…, lots)` | Close by lots |
 | `risk_market_order(…, risk_percent, sl_pips)` | Auto-sized market order |
 | `get_bars(…)` | Normalized OHLCV list |

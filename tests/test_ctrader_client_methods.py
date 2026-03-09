@@ -1,5 +1,9 @@
 import os
+import sys
 import time
+
+# ensure the top-level script is on PYTHONPATH for tests
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import pytest
 from dotenv import load_dotenv

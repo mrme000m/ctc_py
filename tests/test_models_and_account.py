@@ -305,6 +305,29 @@ class TestSymbolDomainObject:
         # index:                   0         1          2         3
         assert call_args[2] == TradeSide.SELL or call_args[2] == 2
 
+    @pytest.mark.asyncio
+    async def test_set_sl_tp_delegates_to_smart_set_sl_tp(self):
+        info = _make_sym_info()
+        account = _make_mock_account()
+        account.client.smart_set_sl_tp = AsyncMock(return_value={"ok": True})
+        sym = Symbol(account, info)
+        result = await sym.set_sl_tp(
+            position_id=555,
+            entry_price=1.2345,
+            trade_side=1,
+            sl_pips=20,
+            tp_pips=40,
+        )
+        assert result == {"ok": True}
+        account.client.smart_set_sl_tp.assert_called_once()
+        call_args = account.client.smart_set_sl_tp.call_args
+        # ensure account_id and symbol_id were supplied correctly
+        # only account_id is passed positionally; the rest are kwargs
+        assert call_args[0][0] == account.id
+        assert call_args[1].get("symbol_id") == sym.id
+        assert call_args[1]["sl_pips"] == 20
+        assert call_args[1]["tp_pips"] == 40
+
 
 # ══════════════════════════════════════════════════════════════════════
 # Account domain object tests

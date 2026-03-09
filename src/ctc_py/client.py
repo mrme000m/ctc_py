@@ -2049,9 +2049,13 @@ class CTraderClient(EventEmitter):
         """
         sym = await self.get_symbol_info(account_id, symbol_id)
         sltp = sym.sl_tp_prices(entry_price, trade_side, sl_pips=sl_pips, tp_pips=tp_pips)
+        # sltp already returns human-readable floats (normalized prices).
+        # previous implementation mistakenly converted them back to raw
+        # integers via :func:`price_to_raw`, causing values like
+        # ``1.15098`` → ``115098``.  We now forward the floats directly.
         params = filter_none({
-            "stopLoss":   price_to_raw(sltp["stopLoss"])   if sltp.get("stopLoss")   is not None else None,
-            "takeProfit": price_to_raw(sltp["takeProfit"]) if sltp.get("takeProfit") is not None else None,
+            "stopLoss":   sltp.get("stopLoss"),
+            "takeProfit": sltp.get("takeProfit"),
         })
         return await self.amend_position_sltp(account_id, position_id, **params)
 

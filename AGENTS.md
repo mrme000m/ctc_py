@@ -650,6 +650,11 @@ bar["volume_raw"]   # int (raw protocol)
 bar["digits"]       # int
 ```
 
+> **Note:** the library ships a pair of helpers for tick data.  `normalize_ticks`
+> understands the delta‑encoded format returned by the API and will accumulate
+> the values before converting to floats; you no longer need to reassemble
+> them yourself when processing `get_ticks()` results.
+
 ### Position
 ```python
 pos: Position = positions[0]
@@ -1026,6 +1031,8 @@ pytest tests/ --cov=src/ctc_py --cov-report=term-missing
 | `test_proto.py` | Protobuf encode/decode round-trips |
 | `test_rate_limit.py` | Token bucket, exponential backoff, historical vs general buckets |
 | `test_utils.py` | Price, pip, lot, money conversion utilities |
+| `test_normalize.py` | New normalization edge cases (ticks, bars, spots) |
+| `test_ctrader_client_methods.py` | Integration smoke test for the `ctrader_client` wrapper |
 
 ### Writing new tests
 
@@ -1145,6 +1152,46 @@ balance = normalize_money(balance_raw, account.money_digits)
 ---
 
 ## 20. Optimal Agent Patterns
+
+## 21. Wrapper & Utility Notes
+
+The repository includes a lightweight wrapper module `ctrader_client.py` that
+builds on top of `ctc_py` and is widely used by the surrounding SSFX trading
+system.  While the wrapper is not part of the core library, it's maintained
+alongside the package and the following features may be useful when working
+with or debugging the system:
+
+* **AccountSession** objects that cache the latest pushed account state
+  (`balance`, `equity`, `margin`, `free_margin`, `leverage`) and replay it via
+  `get_full_account_info()` alongside the normal `Account.get_info()` results.
+  This avoids empty values during live streams and powers the `calculate_safe_volume`
+  helper described below.
+* Convenience methods mirroring the high‑level API (`buy`, `sell`, `risk_buy`,
+  `buy_limit`, `close_position`, …) accessible via `session = await
+  get_account_session(account_id, access_token)`.
+* A **legacy compatibility layer** with `place_market_order()` and a
+  `PositionProxy` type, designed to replicate the interface of an older
+  internal client – very handy when migrating scripts or analysing logs.
+* Additional utilities:
+  * `calculate_safe_volume(symbol, side, desired_lots, …)` combines
+    `SymbolInfo.max_affordable_lots()` (margin cap) with the built‑in
+    `lots_for_risk()` result, and then snaps to step/min/max.  Useful when
+    you need a volume that's safe both from a margin and a risk perspective.
+  * `modify_position(position_id, stop_loss=…, take_profit=…)` accepts
+    absolute prices and sends a raw `amend_position_sltp` request, avoiding
+    pip‑conversion rounding errors.
+  * `get_symbol_price()`, `get_deals_by_position()`, and other helpers
+    designed for the example/debug scripts.
+* The debug/example script itself (`examples/debug_ctrader_client.py`) now
+  includes a robust pretty‑printer that prints `N/A` when fields are missing
+  (common during interim `ORDER_ACCEPTED` events) and handles nested data
+  structures gracefully.
+
+Because the wrapper lives in the same repo, the tests include an integration
+smoke test (`tests/test_ctrader_client_methods.py`) that exercises most of
+these methods; see the testing section above.
+
+# 21. Optimal Agent Patterns
 
 ### Pattern 1: Session initialization
 
