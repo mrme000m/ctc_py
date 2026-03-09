@@ -153,7 +153,7 @@ All new methods are on `CTraderClient`:
 | `smart_stop_order(…, lots, price, sl_pips, tp_pips)` | Stop order |
 | `smart_set_sl_tp(…, entry_price, trade_side, sl_pips, tp_pips)` | Set SL/TP by pips |
 
-> **Bug fix:** prior releases erroneously converted the normalized SL/TP floats back to raw integers; values are now forwarded unchanged.
+> **Bug fix:** smart_set_sl_tp previously attempted to forward the human-readable SL/TP floats directly to the API. The protocol expects **raw price units (×100 000)**, so the values are now explicitly converted to raw integers before sending. An earlier patch had removed this conversion by mistake and was reverted.
 
 > **Bug fix:** `close_all_positions()` now casts `tradeData.volume` to an integer before comparing/using it. API responses sometimes returned the volume as a string.
 | `smart_close_position(…, lots)` | Close by lots |

@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from ctc_py.client import CTraderClient, CTraderClientConfig
+from ctc_py.constants import PayloadType
 from ctc_py.errors import InsufficientMarginError
 
 
@@ -32,6 +33,21 @@ def _make_symbol() -> MagicMock:
     sym.sl_tp_prices.return_value = {"stopLoss": None, "takeProfit": None}
     return sym
 
+
+@pytest.mark.asyncio
+async def test_get_assets_and_symbols_delegates(monkeypatch):
+    client = _make_client()
+    client._request = AsyncMock(return_value={})
+    await client.get_assets(123)
+    client._request.assert_awaited_once_with(PayloadType.ASSET_LIST_REQ, {"ctidTraderAccountId": 123})
+    client._request.reset_mock()
+    await client.get_symbol_categories(123)
+    client._request.assert_awaited_once_with(PayloadType.SYMBOL_CATEGORY_REQ, {"ctidTraderAccountId": 123})
+    client._request.reset_mock()
+    # margin call methods
+    await client.get_margin_calls(123)
+    client._request.assert_awaited_once_with(PayloadType.MARGIN_CALL_LIST_REQ, {"ctidTraderAccountId": 123})
+    client._request.reset_mock()
 
 @pytest.mark.asyncio
 async def test_smart_market_order_raises_before_send_when_unaffordable():
@@ -107,11 +123,13 @@ async def test_smart_set_sl_tp_sends_normalized_prices():
     )
 
     assert result == {"ok": True}
+    # should convert to raw ints before calling amend_position_sltp
     client.amend_position_sltp.assert_awaited_once_with(
         1, 12345,
-        stopLoss=1.15098,
-        takeProfit=1.15500,
+        stopLoss=115098,
+        takeProfit=115500,
     )
+
 
     # also try sending only one side; filter_none should omit the other key
     sym.sl_tp_prices.return_value = {"stopLoss": None, "takeProfit": 1.20000}
@@ -125,9 +143,10 @@ async def test_smart_set_sl_tp_sends_normalized_prices():
         tp_pips=50,
     )
     assert result2 == {"ok": True}
+    # takeProfit should be converted to raw
     client.amend_position_sltp.assert_awaited_once_with(
         1, 999,
-        takeProfit=1.20000,
+        takeProfit=120000,
     )
 
 

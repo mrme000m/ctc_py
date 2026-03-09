@@ -66,6 +66,15 @@ from .normalize import (
     normalize_deals,
     normalize_execution,
     normalize_trader,
+    # newly added normals
+    normalize_asset,
+    normalize_asset_class,
+    normalize_symbol,
+    normalize_margin_call,
+    normalize_margin_calls,
+    normalize_dynamic_leverage,
+    normalize_position_unrealized_pnl,
+    normalize_position_unrealized_pnls,
 )
 
 logger = logging.getLogger("ctc_py")
@@ -2051,13 +2060,11 @@ class CTraderClient(EventEmitter):
         """
         sym = await self.get_symbol_info(account_id, symbol_id)
         sltp = sym.sl_tp_prices(entry_price, trade_side, sl_pips=sl_pips, tp_pips=tp_pips)
-        # sltp already returns human-readable floats (normalized prices).
-        # previous implementation mistakenly converted them back to raw
-        # integers via :func:`price_to_raw`, causing values like
-        # ``1.15098`` → ``115098``.  We now forward the floats directly.
+        # sltp returns human-readable floats; convert to raw integers
+        # before sending to the protocol which expects prices in 1/100000
         params = filter_none({
-            "stopLoss":   sltp.get("stopLoss"),
-            "takeProfit": sltp.get("takeProfit"),
+            "stopLoss":   price_to_raw(sltp.get("stopLoss")) if sltp.get("stopLoss") is not None else None,
+            "takeProfit": price_to_raw(sltp.get("takeProfit")) if sltp.get("takeProfit") is not None else None,
         })
         return await self.amend_position_sltp(account_id, position_id, **params)
 
