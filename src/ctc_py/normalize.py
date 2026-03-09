@@ -164,10 +164,10 @@ def normalize_bar(
     return {
         "time":         _minutes_to_dt(ts_min),
         "timestamp_ms": ts_ms,
-        "open":         normalize_price(open_raw),
-        "high":         normalize_price(high_raw),
-        "low":          normalize_price(low_raw),
-        "close":        normalize_price(close_raw),
+        "open":         normalize_price(open_raw, digits),
+        "high":         normalize_price(high_raw, digits),
+        "low":          normalize_price(low_raw, digits),
+        "close":        normalize_price(close_raw, digits),
         "volume":       normalize_lots(vol_raw),
         "volume_raw":   vol_raw,
         "digits":       digits,
@@ -271,8 +271,8 @@ def normalize_spot(spot: dict[str, Any], *, digits: int = 5, pip_position: int =
     sc_raw       = spot.get("sessionClose")
     ts_ms        = spot.get("timestamp")
 
-    bid = normalize_price(int(bid_raw)) if bid_raw is not None else None
-    ask = normalize_price(int(ask_raw)) if ask_raw is not None else None
+    bid = normalize_price(int(bid_raw), digits) if bid_raw is not None else None
+    ask = normalize_price(int(ask_raw), digits) if ask_raw is not None else None
     mid = (bid + ask) / 2 if bid is not None and ask is not None else None
     spread_pips = (
         raw_to_pips(int(ask_raw) - int(bid_raw), pip_position)
@@ -295,7 +295,7 @@ def normalize_spot(spot: dict[str, Any], *, digits: int = 5, pip_position: int =
         "digits":      digits,
     }
     if sc_raw is not None:
-        result["session_close"] = normalize_price(int(sc_raw))
+        result["session_close"] = normalize_price(int(sc_raw), digits)
     return result
 
 
@@ -338,9 +338,9 @@ def normalize_position(pos: dict[str, Any], *, money_digits: int = 2, pip_positi
         "trade_side":   _enum_to_int(td.get("tradeSide", 0), _TRADE_SIDE_MAP),
         "volume":       normalize_lots(vol_raw),
         "volume_raw":   vol_raw,
-        "entry_price":  normalize_price(entry_raw),
-        "stop_loss":    normalize_price(int(sl_raw)) if sl_raw is not None else None,
-        "take_profit":  normalize_price(int(tp_raw)) if tp_raw is not None else None,
+        "entry_price":  normalize_price(entry_raw, digits),
+        "stop_loss":    normalize_price(int(sl_raw), digits) if sl_raw is not None else None,
+        "take_profit":  normalize_price(int(tp_raw), digits) if tp_raw is not None else None,
         "swap":         normalize_money(swap_raw, money_digits),
         "commission":   normalize_money(comm_raw, money_digits),
         "open_time":    _ms_to_dt(int(open_ts)) if open_ts else None,
@@ -426,10 +426,10 @@ def normalize_order(order: dict[str, Any], *, money_digits: int = 2, digits: int
         "trade_side":  _enum_to_int(td.get("tradeSide", 0), _TRADE_SIDE_MAP),
         "volume":      normalize_lots(vol_raw),
         "volume_raw":  vol_raw,
-        "limit_price": normalize_price(int(lp_raw)) if lp_raw is not None else None,
-        "stop_price":  normalize_price(int(sp_raw)) if sp_raw is not None else None,
-        "stop_loss":   normalize_price(int(sl_raw)) if sl_raw is not None else None,
-        "take_profit": normalize_price(int(tp_raw)) if tp_raw is not None else None,
+        "limit_price": normalize_price(int(lp_raw), digits) if lp_raw is not None else None,
+        "stop_price":  normalize_price(int(sp_raw), digits) if sp_raw is not None else None,
+        "stop_loss":   normalize_price(int(sl_raw), digits) if sl_raw is not None else None,
+        "take_profit": normalize_price(int(tp_raw), digits) if tp_raw is not None else None,
         "expiry_time": _ms_to_dt(int(exp_ts)) if exp_ts else None,
         "comment":     td.get("comment", ""),
         "status":      _enum_to_int(order.get("orderStatus", 0), _ORDER_STATUS_MAP),
@@ -441,7 +441,7 @@ def normalize_order(order: dict[str, Any], *, money_digits: int = 2, digits: int
     if td.get("clientOrderId") is not None:
         normalized["client_order_id"] = td.get("clientOrderId")
     if order.get("baseSlippagePrice") is not None:
-        normalized["base_slippage_price"] = normalize_price(int(order.get("baseSlippagePrice")))
+        normalized["base_slippage_price"] = normalize_price(int(order.get("baseSlippagePrice")), digits)
     if order.get("slippageInPoints") is not None:
         normalized["slippage_in_points"] = int(order.get("slippageInPoints"))
     if order.get("relativeStopLoss") is not None:
@@ -527,7 +527,7 @@ def normalize_deal(deal: dict[str, Any], *, money_digits: int = 2, digits: int =
         "trade_side":  _enum_to_int(deal.get("tradeSide", 0), _TRADE_SIDE_MAP),
         "volume":      normalize_lots(vol_raw),
         "volume_raw":  vol_raw,
-        "fill_price":  normalize_price(exec_price_raw),
+        "fill_price":  normalize_price(exec_price_raw, digits),
         "commission":  normalize_money(comm_raw, money_digits),
         "swap":        normalize_money(swap_raw, money_digits),
         "close_pnl":   normalize_money(int(gross_pnl_raw), cpd_money_digs) if gross_pnl_raw is not None else None,

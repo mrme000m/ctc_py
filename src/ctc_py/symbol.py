@@ -107,32 +107,32 @@ class SymbolInfo:
     def pip_raw(self) -> int:
         """Size of 1 pip in raw protocol units.
 
-        E.g. pip_position=4 → 10 raw units
+        E.g. pip_position=4, digits=5 → 10 raw units
         """
-        return pips_to_raw(1, self.pip_position)
+        return pips_to_raw(1, self.pip_position, self.digits)
 
     # ── Conversion helpers ──────────────────────────────────────────
 
     def price_to_raw(self, price: float) -> int:
         """Convert a float price to raw protocol integer."""
-        return price_to_raw(price)
+        return price_to_raw(price, self.digits)
 
     def raw_to_price(self, raw: int) -> float:
         """Convert a raw protocol integer to a float price."""
-        return normalize_price(raw)
+        return normalize_price(raw, self.digits)
 
     def format_price(self, raw_or_float: int | float) -> str:
         """Format a price (raw int or human float) to the correct number of digits."""
-        price = normalize_price(raw_or_float) if raw_or_float > 1_000 else float(raw_or_float)
+        price = self.raw_to_price(raw_or_float) if raw_or_float > 1_000 else float(raw_or_float)
         return f"{price:.{self.digits}f}"
 
     def pips_to_raw(self, pips: float) -> int:
-        """Convert pips to raw price delta (uses this symbol's pip_position)."""
-        return pips_to_raw(pips, self.pip_position)
+        """Convert pips to raw price delta (uses this symbol's pip_position and digits)."""
+        return pips_to_raw(pips, self.pip_position, self.digits)
 
     def raw_to_pips(self, raw_delta: int | float) -> float:
-        """Convert a raw price delta to pips (uses this symbol's pip_position)."""
-        return raw_to_pips(raw_delta, self.pip_position)
+        """Convert a raw price delta to pips (uses this symbol's pip_position and digits)."""
+        return raw_to_pips(raw_delta, self.pip_position, self.digits)
 
     def lots_to_volume(self, lots: float) -> int:
         """Convert lots to raw protocol volume integer."""
@@ -409,13 +409,14 @@ class SymbolInfo:
         -------
         dict with ``"stopLoss"`` and ``"takeProfit"`` as human floats (or ``None``).
         """
-        entry_raw = price_to_raw(entry_price)
+        entry_raw = self.price_to_raw(entry_price)
         return sl_tp_from_pips(
             entry_raw,
             sl_pips=sl_pips,
             tp_pips=tp_pips,
             trade_side=trade_side,
             pip_position=self.pip_position,
+            digits=self.digits,
         )
 
     def sl_tp_raw(

@@ -10,33 +10,54 @@ from typing import Any
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Price helpers  (raw prices are in 1/100000 of price unit)
+# Price helpers  (raw prices are scaled by 10^digits)
 # ──────────────────────────────────────────────────────────────────────
 
+# Legacy constant for backward compatibility (use 10**digits instead)
 PRICE_SCALE = 100_000
 
 
-def normalize_price(raw_price: int | float) -> float:
+def normalize_price(raw_price: int | float, digits: int = 5) -> float:
     """Convert a raw protocol price to a float.
 
-    Example: ``123000`` → ``1.23``
+    Parameters
+    ----------
+    raw_price:
+        Raw protocol price integer.
+    digits:
+        Number of decimal places in the price (default 5 for FX).
+
+    Example
+    -------
+    ``normalize_price(123000, 5)`` → ``1.23``
+    ``normalize_price(6761922, 2)`` → ``67619.22`` (BTCUSD)
     """
-    return float(raw_price) / PRICE_SCALE
+    return float(raw_price) / (10 ** digits)
 
 
-def price_to_raw(price: float) -> int:
+def price_to_raw(price: float, digits: int = 5) -> int:
     """Convert a float price to the raw protocol integer.
 
-    Example: ``1.23`` → ``123000``
+    Parameters
+    ----------
+    price:
+        Human-readable price float.
+    digits:
+        Number of decimal places in the price (default 5 for FX).
+
+    Example
+    -------
+    ``price_to_raw(1.23, 5)`` → ``123000``
+    ``price_to_raw(67619.22, 2)`` → ``6761922`` (BTCUSD)
     """
-    return round(price * PRICE_SCALE)
+    return round(price * (10 ** digits))
 
 
 # ──────────────────────────────────────────────────────────────────────
 # Pip helpers
 # ──────────────────────────────────────────────────────────────────────
 
-def pips_to_raw(pips: float, pip_position: int) -> int:
+def pips_to_raw(pips: float, pip_position: int, digits: int = 5) -> int:
     """Convert a pip distance to a raw price delta.
 
     Parameters
@@ -45,13 +66,30 @@ def pips_to_raw(pips: float, pip_position: int) -> int:
         Distance in pips (e.g. ``50.0`` for 50 pips).
     pip_position:
         Digit position where the pip sits (e.g. ``4`` for most FX pairs).
+    digits:
+        Number of decimal places in the price (default 5 for FX).
+
+    Example
+    -------
+    ``pips_to_raw(30, 4, 5)`` → ``300`` (EURUSD: 30 pips = 0.0030 = 300 raw)
+    ``pips_to_raw(100, 1, 2)`` → ``1000`` (BTCUSD: 100 pips = 10.00 = 1000 raw)
     """
-    return round(pips * (10 ** (5 - pip_position)))
+    return round(pips * (10 ** (digits - pip_position)))
 
 
-def raw_to_pips(raw_delta: int | float, pip_position: int) -> float:
-    """Convert a raw price delta to pips."""
-    return float(raw_delta) / (10 ** (5 - pip_position))
+def raw_to_pips(raw_delta: int | float, pip_position: int, digits: int = 5) -> float:
+    """Convert a raw price delta to pips.
+
+    Parameters
+    ----------
+    raw_delta:
+        Raw price delta.
+    pip_position:
+        Digit position where the pip sits.
+    digits:
+        Number of decimal places in the price (default 5 for FX).
+    """
+    return float(raw_delta) / (10 ** (digits - pip_position))
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -105,13 +143,14 @@ def sl_tp_from_pips(
     tp_pips: float | None = None,
     trade_side: int,  # 1 = BUY, 2 = SELL
     pip_position: int,
+    digits: int = 5,
 ) -> dict[str, float | None]:
     """Compute absolute Stop Loss / Take Profit prices from pip distances.
 
     Parameters
     ----------
     entry_raw:
-        Entry price in raw format (1/100000).
+        Entry price in raw format.
     sl_pips:
         Stop-loss distance in pips, or ``None`` to skip.
     tp_pips:
@@ -120,6 +159,8 @@ def sl_tp_from_pips(
         ``1`` for BUY, ``2`` for SELL.
     pip_position:
         Pip position digit.
+    digits:
+        Number of decimal places in the price (default 5 for FX).
 
     Returns
     -------
@@ -128,18 +169,18 @@ def sl_tp_from_pips(
     result: dict[str, float | None] = {"stopLoss": None, "takeProfit": None}
 
     if sl_pips is not None:
-        sl_raw = pips_to_raw(sl_pips, pip_position)
+        sl_raw = pips_to_raw(sl_pips, pip_position, digits)
         if trade_side == 1:  # BUY
-            result["stopLoss"] = normalize_price(entry_raw - sl_raw)
+            result["stopLoss"] = normalize_price(entry_raw - sl_raw, digits)
         else:
-            result["stopLoss"] = normalize_price(entry_raw + sl_raw)
+            result["stopLoss"] = normalize_price(entry_raw + sl_raw, digits)
 
     if tp_pips is not None:
-        tp_raw = pips_to_raw(tp_pips, pip_position)
+        tp_raw = pips_to_raw(tp_pips, pip_position, digits)
         if trade_side == 1:  # BUY
-            result["takeProfit"] = normalize_price(entry_raw + tp_raw)
+            result["takeProfit"] = normalize_price(entry_raw + tp_raw, digits)
         else:
-            result["takeProfit"] = normalize_price(entry_raw - tp_raw)
+            result["takeProfit"] = normalize_price(entry_raw - tp_raw, digits)
 
     return result
 
