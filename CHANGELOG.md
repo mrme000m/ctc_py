@@ -194,7 +194,21 @@ sym.sl_tp_raw(108500, TradeSide.BUY, sl_pips=30, tp_pips=90)
 
 ---
 
-### 4. `src/ctc_py/normalize.py` — Response Normalizers
+### 4. `src/ctc_py/constants.py` — New Enums
+
+Added a slew of IntEnum classes mirroring ProtoOA types:
+`TotalMarginCalculationType`, `LimitedRiskMarginCalculationStrategy`, `StopOutStrategy`,
+`TradingMode`, `SwapCalculationType`, `CommissionType`, `MinCommissionType`,
+`SymbolDistanceType`, `DayOfWeek`, `ChangeBalanceType`, `ChangeBonusType`.
+These cover new fields on `TraderInfo`, `Symbol`, `Deal`, and various events.
+
+### 5. `src/ctc_py/models.py` — TypedDict Response Models
+
+Extended existing models with many optional fields (see docs) and added
+`TrailingSLChangedEvent`, `MarginChangedEvent`, `DepositWithdraw`,
+`CtidTraderAccount`, `LightSymbol`, `ArchivedSymbol`.
+
+### 6. `src/ctc_py/normalize.py` — Response Normalizers
 
 Pure functions converting raw API dicts to human-readable dicts:
 
@@ -205,9 +219,9 @@ Pure functions converting raw API dicts to human-readable dicts:
 | `normalize_spot(spot)` | raw spot event | `bid`, `ask`, `mid`, `spread_pips`, `time` |
 | `normalize_position(pos)` | raw position dict | `entry_price`, `volume` (lots), `swap`, `commission` (floats) |
 | `normalize_order(order)` | raw order dict | `limit_price`, `stop_price`, `volume` (lots) as floats |
-| `normalize_deal(deal)` | raw deal dict | `fill_price`, `close_pnl`, `commission`, `volume` (lots) |
+| `normalize_deal(deal)` | raw deal dict | `fill_price`, `close_pnl`, `commission`, `volume` (lots) — now also returns execution_time, requested_volume, margin_rate, label, comment |
 | `normalize_execution(event)` | raw execution event | wraps position + order + deal |
-| `normalize_trader(resp)` | raw trader response | `balance`, `leverage` (floats) |
+| `normalize_trader(resp)` | raw trader response | `balance`, `leverage` (floats) — now returns `money_digits` and handles extended account fields such as max_leverage, stop_out_strategy, total_margin_calculation_type (string or int), etc. |
 
 ---
 

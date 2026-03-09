@@ -29,7 +29,7 @@ src/ctc_py/
 ├── __init__.py      # All public exports
 ├── account.py       # Account & Symbol domain objects  ← HIGH-LEVEL API
 ├── client.py        # CTraderClient (WebSocket, all request methods)
-├── constants.py     # Enums: PayloadType, TradeSide, TrendbarPeriod, etc.
+├── constants.py     # Enums: PayloadType, TradeSide, TrendbarPeriod, ChangeBalanceType, TotalMarginCalculationType, TradingMode, StopOutStrategy, SwapCalculationType, CommissionType, SymbolDistanceType, DayOfWeek, ChangeBonusType, etc.
 ├── errors.py        # Exception hierarchy (12 typed trading errors)
 ├── events.py        # Async EventEmitter
 ├── models.py        # TypedDict response models (Bar, Position, Order, …)
@@ -594,6 +594,11 @@ from ctc_py import (
     normalize_deal, normalize_deals,
     normalize_execution,
     normalize_trader,
+    normalize_trailing_sl_changed,  # new event normalizer
+    normalize_margin_changed,
+    normalize_deposit_withdraw,
+    normalize_light_symbol,
+    normalize_archived_symbol,
 )
 ```
 
@@ -608,7 +613,8 @@ All normalizers are **pure functions** — they never modify the input dict.
 | `normalize_order(order, money_digits, digits)` | raw order | `limit_price, stop_price, volume` (lots) as float |
 | `normalize_deal(deal, money_digits, digits)` | raw deal | `fill_price, close_pnl, commission, volume` (lots) |
 | `normalize_execution(event, money_digits, digits, pip_position)` | raw execution | wraps position + order + deal |
-| `normalize_trader(resp)` | raw trader response | `balance, leverage` (floats), `money_digits` |
+| `normalize_trader(resp)` | raw trader response | `balance, leverage` (floats), `money_digits`, plus extended account fields (max_leverage, stop_out_strategy, total_margin_calculation_type, etc.) |
+
 
 
 ---
