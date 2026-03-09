@@ -419,8 +419,15 @@ from ctc_py import (
     normalize_deal,
     normalize_deals,
     normalize_execution, # raw execution event → typed dict
-    normalize_trader,    # raw trader response → {balance, leverage, ...}
+    normalize_trader,    # raw trader response → {balance, leverage, money_digits, metadata}
 )
+
+# A note on enums and constants:
+# New IntEnum classes such as `ChangeBalanceType`, `TotalMarginCalculationType`,
+# `StopOutStrategy`, `TradingMode`, `SwapCalculationType`, `CommissionType`,
+# `SymbolDistanceType`, `DayOfWeek`, `ChangeBalanceType`, and `ChangeBonusType`
+# are exposed under `ctc_py.constants` and cover corresponding API fields.
+
 
 # Example: using low-level client with normalizer
 raw = await client.get_trendbars(account_id, symbol_id=sym_id,
